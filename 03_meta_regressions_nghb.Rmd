@@ -1,0 +1,239 @@
+---
+title: "Meta-analysis part 2: Between neighbourhood differences"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(metafor)
+library(janitor)
+library(kableExtra)
+```
+
+## Preliminaries
+
+Preliminaries: assign NA as missing in R, and coaelce all coefficients to a single column.
+
+```{r}
+# # Read in model coefficient estimates
+# coefficients2 <- readxl::read_excel('data/between_neighbourhoods_coeff.csv')
+# # Clean column names
+# coefficients2 <- clean_names(coefficients2)
+
+# Read in model coefficient estimates
+coefficients2 <- readxl::read_excel('data/updated_coefficients/TableA4_All_TTWAs_Results_Ext_Models.xlsx')
+# Clean column names
+coefficients2 <- clean_names(coefficients2)
+
+# Define NAs appropriately
+coefficients2 <- coefficients2 %>% 
+  mutate(
+    across(everything(), function(var) 
+      ifelse(grepl("NA", var), NA, var) 
+))
+
+# Restructure coefficients in one column only for pre and post
+coefficients2 <- coefficients2 %>% 
+  mutate(
+    pandemic_total_interaction = coalesce(
+      pandemic_and_homeworking_interaction_total_estimate, 
+      pandemic_and_pt_interaction_total_estimate,
+      pandemic_pt_and_homeworking_interaction_total_estimate
+    ),
+    prepandemic_total_interaction = coalesce(
+      homeworking_interaction_total_estimate, 
+      pt_interaction_total_estimate,
+      homeworking_and_pt_interaction_total_estimate
+    )
+)
+```
+
+Extract coefficient estimates and caclulated standard error from CI, i.e. (hci - lci) / (2 * 1.96).
+
+```{r}
+# extract pandemic coefficient and CI
+coefficients2 <- coefficients2 %>%
+  mutate(
+    split_vals = str_split(pandemic_total_interaction, "\\(|,|\\)"),
+    coef_pandemic_interaction_total = map_dbl(split_vals, ~ as.numeric(str_trim(.x[1]))),
+    ci_low_pandemic_interaction_total = map_dbl(split_vals, ~ as.numeric(str_trim(.x[2]))),
+    ci_high_pandemic_interaction_total = map_dbl(split_vals, ~ as.numeric(str_trim(.x[3])))
+  )
+
+# extract prepandemic coefficient and CI
+coefficients2 <- coefficients2 %>%
+  mutate(
+    split_vals_pre = str_split(prepandemic_total_interaction, "\\(|,|\\)"),
+    coef_prepandemic_interaction_total = map_dbl(split_vals_pre, ~ as.numeric(str_trim(.x[1]))),
+    ci_low_prepandemic_interaction_total = map_dbl(split_vals_pre, ~ as.numeric(str_trim(.x[2]))),
+    ci_high_prepandemic_interaction_total = map_dbl(split_vals_pre, ~ as.numeric(str_trim(.x[3])))
+)
+
+# Compute standard errors
+coefficients2 <- coefficients2 %>%
+  mutate(
+    se_pandemic_interaction_total = 
+      (ci_high_pandemic_interaction_total - ci_low_pandemic_interaction_total) / 
+      (2 * 1.96),
+    se_prepandemic_interaction_total = 
+      (ci_high_prepandemic_interaction_total - ci_low_prepandemic_interaction_total) / 
+      (2 * 1.96)
+)
+```
+
+## Prepandemic
+
+Fit models (using maximum likelihood) and estimate model statistics.
+
+```{r}
+# Fit models
+prepandemic_models_ngb <- coefficients2 %>% 
+  split(.$model) %>% 
+  lapply(function(data_subset){
+  m_res <- rma(
+    yi = coef_prepandemic_interaction_total,
+    sei = se_prepandemic_interaction_total,
+    mods = ~ population_band + housing_affordability_band,
+    data = data_subset,
+    method = "ML"
+  )
+})
+
+# Calculate CI of random effect parameters
+conf_int_pre <- prepandemic_models_ngb %>%
+  lapply(function(mod){
+    confi_summ <- confint(mod)$random %>%
+      as.data.frame() %>%
+      mutate(
+        estimate = formatC(estimate, digits = 2, format = "f"),
+        across(-c(estimate), formatC, digits = 2, format = "f")
+      )
+    
+    data.frame(
+      var = rownames(confi_summ),
+      coeff = paste0(confi_summ$estimate, ' (', confi_summ$ci.lb, ', ', confi_summ$ci.ub, ')')
+    )
+  }) %>%
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff)
+
+# Model fit AIC/BIC
+model_fit <- sapply(prepandemic_models_ngb, function(x) x$fit.stats[c(1, 3),1])
+model_fit <- as.data.frame(model_fit) %>% 
+  mutate(across(everything(), formatC, digits = 2, format = "f"))
+model_fit$var <- rownames(prepandemic_models_ngb[[1]]$fit.stats)[c(1, 3)]
+
+# Summarise coefficients
+prepandemic_ngb_results <- prepandemic_models_ngb %>% 
+  lapply(summary) %>% 
+  lapply(function(x){
+    # Beta
+    beta <- formatC(x$beta, digits = 3, format = "f")
+    beta <- ifelse(x$pval <= 0.05, paste0(beta, "*"), beta)
+    # Error
+    se <- formatC(x$se, digits = 3, format = "f")
+    coeff <- paste(beta, paste0('(', se, ')'))
+    
+    data.frame(var = rownames(x$beta), coeff = coeff)
+  }) %>% 
+  # set_names(names(form_prepandemic)) %>% 
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff) %>%
+  mutate(across(everything(), ~replace_na(.x, "")))
+
+# Add model statistics
+prepandemic_ngb_results <- prepandemic_ngb_results %>% 
+  bind_rows(model_fit) %>% 
+  bind_rows(conf_int_pre)
+```
+
+### Prepandemic results
+
+```{r}
+kableExtra::kable(prepandemic_ngb_results, format = 'html') %>% 
+  kable_classic() %>% 
+  row_spec(3, extra_css = "border-bottom: 2px solid black;")
+```
+
+## Post pandemic meta-analysis
+
+Fit models and summarise results
+
+```{r}
+
+# Fit models
+pandemic_models_ngb <- coefficients2 %>% 
+  split(.$model) %>% 
+  lapply(function(data_subset){
+    m_res <- rma(
+      yi = coef_pandemic_interaction_total,
+      sei = se_pandemic_interaction_total,
+      mods = ~ population_band + housing_affordability_band,
+      # mods = ~ population_band + housing_affordability_band + coef_prepandemic_interaction_total,
+      data = data_subset,
+      method = "ML"
+    )
+})
+
+# Calculate CI of random effect parameters
+conf_int_pandemic <- pandemic_models_ngb %>%
+  lapply(function(mod){
+    confi_summ <- confint(mod)$random %>%
+      as.data.frame() %>%
+      mutate(
+        estimate = formatC(estimate, digits = 2, format = "f"),
+        across(-c(estimate), formatC, digits = 2, format = "f")
+      )
+    
+    data.frame(
+      var = rownames(confi_summ),
+      coeff = paste0(confi_summ$estimate, ' (', confi_summ$ci.lb, ', ', confi_summ$ci.ub, ')')
+    )
+  }) %>%
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff)
+
+# Model fit AIC/BIC
+model_fit_pandemic <- sapply(pandemic_models_ngb, function(x) x$fit.stats[c(1, 3),1])
+model_fit_pandemic <- as.data.frame(model_fit_pandemic) %>% 
+  mutate(across(everything(), formatC, digits = 2, format = "f"))
+model_fit_pandemic$var <- rownames(pandemic_models_ngb[[1]]$fit.stats)[c(1, 3)]
+
+# Summarise coefficients
+pandemic_ngb_results <- pandemic_models_ngb %>% 
+  lapply(summary) %>% 
+  lapply(function(x){
+    # Beta
+    beta <- formatC(x$beta, digits = 3, format = "f")
+    beta <- ifelse(x$pval <= 0.05, paste0(beta, "*"), beta)
+    # Error
+    se <- formatC(x$se, digits = 3, format = "f")
+    coeff <- paste(beta, paste0('(', se, ')'))
+    
+    data.frame(var = rownames(x$beta), coeff = coeff)
+  }) %>% 
+  # set_names(names(form_prepandemic)) %>% 
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff) %>%
+  mutate(across(everything(), ~replace_na(.x, "")))
+
+# Add model statistics
+pandemic_ngb_results <- pandemic_ngb_results %>% 
+  bind_rows(model_fit_pandemic) %>% 
+  bind_rows(conf_int_pandemic)
+
+```
+
+### Results post-pandemic
+
+```{r}
+kableExtra::kable(pandemic_ngb_results, format = 'html') %>% 
+  kable_classic() %>% 
+  row_spec(3, extra_css = "border-bottom: 2px solid black;")
+```
+
+

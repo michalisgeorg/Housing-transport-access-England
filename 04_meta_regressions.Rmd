@@ -1,0 +1,378 @@
+---
+title: "Meta-analysis"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(metafor)
+library(janitor)
+library(kableExtra)
+```
+
+
+Resources:
+
+- Full documentation here: <https://www.metafor-project.org/doku.php/metafor>
+- Package paper: <https://www.jstatsoft.org/article/view/v036i03>
+
+This meta regression is fitted in a mixed effects fmw. Accordingly, this is expected to account for specific/unobserved heterogeneity of each city.
+
+## Read and format data
+
+```{r}
+# # Read in model coefficient estimates
+# coefficients <- read_csv('data/model_coefficients.csv')
+# # Clean column names
+# coefficients <- clean_names(coefficients)
+
+# Updated coefficients 2025-08-19
+coefficients <- 
+  readxl::read_excel('data/updated_coefficients/TableA3_TTWAs_results.xlsx')
+coefficients <- 
+  clean_names(coefficients)
+
+```
+
+## Extract coefficients and CI
+
+```{r}
+# extract coefficient and CI
+coefficients <- coefficients %>%
+  mutate(
+    split_vals = str_split(pandemic_interaction_estimate, "\\(|,|\\)"),
+    coef_pandemic_interaction = map_dbl(split_vals, ~ as.numeric(str_trim(.x[1]))),
+    ci_low_pandemic_interaction = map_dbl(split_vals, ~ as.numeric(str_trim(.x[2]))),
+    ci_high_pandemic_interaction = map_dbl(split_vals, ~ as.numeric(str_trim(.x[3])))
+)
+
+# Extract prepandemic coefficients
+coefficients <- coefficients %>%
+  mutate(
+    pre_split_vals = str_split(pc1_pc2_estimate, "\\(|,|\\)"),
+    prepandemic_coeff = map_dbl(pre_split_vals, ~ as.numeric(str_trim(.x[1]))),
+    prepandemic_ci_low = map_dbl(pre_split_vals, ~ as.numeric(str_trim(.x[2]))),
+    prepandemic_ci_high = map_dbl(pre_split_vals, ~ as.numeric(str_trim(.x[3])))
+  )
+
+# Compute standard errors
+coefficients <- coefficients %>%
+  mutate(
+    se_pandemic_interaction = 
+      (ci_high_pandemic_interaction - ci_low_pandemic_interaction) / 
+      (2 * 1.96),
+    se_prepandemic = 
+      (prepandemic_ci_high - prepandemic_ci_low) / 
+      (2 * 1.96)
+)
+```
+
+## Pre pandemic meta-regression PC1
+
+
+```{r}
+# Define formulas
+form_prepandemic <- list(
+  `MR1:PRE-PC1` = formula(~ 1),
+  `MR2:PRE-PC1` = formula(~ population_band),
+  `MR3:PRE-PC1` = formula(~ housing_affordability_band),
+  `MR4:PRE-PC1` = formula(~ population_band  + housing_affordability_band),
+  `MR5:PRE-PC1` = formula(~ pt_hw_band),
+  `MR6:PRE-PC1` = formula(~ population_band + housing_affordability_band + pt_hw_band)
+)
+
+```
+
+Fit pre pandemic models PC1
+
+```{r}
+# Fit models
+prepandemic_models_pc1 <- lapply(form_prepandemic, function(form){
+  filtered_data <- coefficients %>%
+    filter(grepl("PC1", variable))
+  
+  m_res <- rma(
+    yi = prepandemic_coeff,
+    sei = se_prepandemic,
+    mods = form,
+    data = filtered_data,
+    method = "ML"
+  )
+})
+
+# Calculate CI of random effect parameters
+conf_int_pre <- prepandemic_models_pc1 %>%
+  lapply(function(mod){
+    confi_summ <- confint(mod)$random %>%
+      as.data.frame() %>%
+      mutate(
+        estimate = formatC(estimate, digits = 2, format = "f"),
+        across(-c(estimate), formatC, digits = 2, format = "f")
+      )
+
+    data.frame(
+      var = rownames(confi_summ),
+      coeff = paste0(confi_summ$estimate, ' (', confi_summ$ci.lb, ', ', confi_summ$ci.ub, ')')
+    )
+  }) %>%
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff)
+
+# Model fit AIC/BIC
+model_fit <- sapply(prepandemic_models_pc1, function(x) x$fit.stats[c(1, 3),1])
+model_fit <- as.data.frame(model_fit) %>% 
+  mutate(across(everything(), formatC, digits = 2, format = "f"))
+model_fit$var <- rownames(prepandemic_models_pc1[[1]]$fit.stats)[c(1, 3)]
+
+# Summarise coefficients
+pc1_prepandemic_results <- prepandemic_models_pc1 %>% 
+  lapply(summary) %>% 
+  lapply(function(x){
+    # Beta
+    beta <- formatC(x$beta, digits = 3, format = "f")
+    beta <- ifelse(x$pval <= 0.05, paste0(beta, "*"), beta)
+    # Error
+    se <- formatC(x$se, digits = 3, format = "f")
+    coeff <- paste(beta, paste0('(', se, ')'))
+    
+    data.frame(var = rownames(x$beta), coeff = coeff)
+  }) %>% 
+  set_names(names(form_prepandemic)) %>% 
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff) %>%
+  mutate(across(everything(), ~replace_na(.x, ""))) %>% 
+  bind_rows(model_fit) %>% 
+  bind_rows(conf_int_pre)
+```
+
+Table 1. Summary of model results for PC1
+
+```{r}
+kableExtra::kable(pc1_prepandemic_results, format = 'html') %>% 
+  kable_classic() %>% 
+  row_spec(4, extra_css = "border-bottom: 2px solid black;")
+```
+
+## Post pandemic effect
+
+### Different models
+
+Define meta regression (in mixed models)
+
+```{r}
+# # Define formulas
+# model_form <- list(
+#   `MR1:PC1` = formula(~ 1),
+#   `MR2:PC1` = formula(~ population_band),
+#   `MR3:PC1` = formula(~ population_band + housing_affordability_band),
+#   `MR4:PC1` = formula(~ housing_affordability_band),
+#   `MR5:PC1` = formula(~ population_band + housing_affordability_band + pt_hw_band)
+# )
+
+
+# Define formulas
+model_form <- list(
+  `MR1:PC1` = formula(~ 1),
+  `MR2:PC1` = formula(~ population_band),
+  `MR3:PC1` = formula(~ housing_affordability_band),
+  `MR4:PC1` = formula(~ population_band  + housing_affordability_band),
+  `MR5:PC1` = formula(~ population_band + housing_affordability_band + pt_hw_band),
+  # `MR6:PC1` = formula(~ housing_affordability_band + prepandemic_coeff),
+  `MR6:PC1` = formula(~ population_band + housing_affordability_band + pt_hw_band + prepandemic_coeff)
+)
+
+```
+
+
+
+Fit models
+
+```{r}
+# Fit models
+meta_regressions_pc1 <- lapply(model_form, function(form){
+  filtered_data <- coefficients %>%
+    filter(grepl("PC1", variable))
+  
+  m_res <- rma(
+    yi = coef_pandemic_interaction,
+    sei = se_pandemic_interaction,
+    mods = form,
+    data = filtered_data,
+    method = "ML"
+  )
+})
+
+# Calculate CI of random effect parameters
+conf_int <- meta_regressions_pc1 %>%
+  lapply(function(mod){
+    confi_summ <- confint(mod)$random %>%
+      as.data.frame() %>%
+      mutate(
+        estimate = formatC(estimate, digits = 2, format = "f"),
+        across(-c(estimate), formatC, digits = 2, format = "f")
+      )
+
+    data.frame(
+      var = rownames(confi_summ),
+      coeff = paste0(confi_summ$estimate, ' (', confi_summ$ci.lb, ', ', confi_summ$ci.ub, ')')
+    )
+  }) %>%
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff)
+
+# Model fit AIC/BIC
+model_fit <- sapply(meta_regressions_pc1, function(x) x$fit.stats[c(1, 3),1])
+model_fit <- as.data.frame(model_fit) %>% 
+  mutate(across(everything(), formatC, digits = 2, format = "f"))
+model_fit$var <- rownames(meta_regressions_pc1[[1]]$fit.stats)[c(1, 3)]
+
+# Summarise coefficients
+pc1_meta_results <- meta_regressions_pc1 %>% 
+  lapply(summary) %>% 
+  lapply(function(x){
+    # Beta
+    beta <- formatC(x$beta, digits = 3, format = "f")
+    beta <- ifelse(x$pval <= 0.05, paste0(beta, "*"), beta)
+    # Error
+    se <- formatC(x$se, digits = 3, format = "f")
+    coeff <- paste(beta, paste0('(', se, ')'))
+    
+    data.frame(var = rownames(x$beta), coeff = coeff)
+  }) %>% 
+  set_names(names(model_form)) %>% 
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff) %>%
+  mutate(across(everything(), ~replace_na(.x, ""))) %>% 
+  bind_rows(model_fit) %>% 
+  bind_rows(conf_int)
+```
+
+Table 2. Summary of model results for postpandemic effect in PC1
+
+```{r}
+kableExtra::kable(pc1_meta_results, format = 'html') %>% 
+  # kable_styling(bootstrap_options = c("striped", "hover")) %>% 
+  kable_classic() %>% 
+  row_spec(5, extra_css = "border-bottom: 2px solid black;")
+```
+
+### Influential check
+
+```{r}
+### calculate influence diagnostics
+inf <- influence(meta_regressions_pc1$`MR6:PC1`)
+
+### plot the influence diagnostics
+# par(mfrow=c(8,1))
+plot(inf)
+```
+
+Re-run excluding influential obs.
+
+```{r}
+
+# Subset excluding influential obs
+subset_influential <- coefficients %>%
+  filter(grepl("PC1", variable)) %>% 
+  slice(-which(inf$inf$inf == "*"))
+
+# Fit models
+meta_regressions_pc1 <- lapply(model_form, function(form){
+  
+  m_res <- rma(
+    yi = coef_pandemic_interaction,
+    sei = se_pandemic_interaction,
+    mods = form,
+    data = subset_influential,
+    method = "ML"
+  )
+})
+
+# Calculate CI of random effect parameters
+conf_int <- meta_regressions_pc1 %>%
+  lapply(function(mod){
+    confi_summ <- confint(mod)$random %>%
+      as.data.frame() %>%
+      mutate(
+        estimate = formatC(estimate, digits = 2, format = "f"),
+        across(-c(estimate), formatC, digits = 2, format = "f")
+      )
+
+    data.frame(
+      var = rownames(confi_summ),
+      coeff = paste0(confi_summ$estimate, ' (', confi_summ$ci.lb, ', ', confi_summ$ci.ub, ')')
+    )
+  }) %>%
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff)
+
+# Model fit AIC/BIC
+model_fit <- sapply(meta_regressions_pc1, function(x) x$fit.stats[c(1, 3),1])
+model_fit <- as.data.frame(model_fit) %>% 
+  mutate(across(everything(), formatC, digits = 2, format = "f"))
+model_fit$var <- rownames(meta_regressions_pc1[[1]]$fit.stats)[c(1, 3)]
+
+# Summarise coefficients
+pc1_meta_results <- meta_regressions_pc1 %>% 
+  lapply(summary) %>% 
+  lapply(function(x){
+    # Beta
+    beta <- formatC(x$beta, digits = 3, format = "f")
+    beta <- ifelse(x$pval <= 0.05, paste0(beta, "*"), beta)
+    # Error
+    se <- formatC(x$se, digits = 3, format = "f")
+    coeff <- paste(beta, paste0('(', se, ')'))
+    
+    data.frame(var = rownames(x$beta), coeff = coeff)
+  }) %>% 
+  set_names(names(model_form)) %>% 
+  bind_rows(.id = 'model') %>%
+  pivot_wider(names_from = model, values_from = coeff) %>%
+  mutate(across(everything(), ~replace_na(.x, ""))) %>% 
+  bind_rows(model_fit) %>% 
+  bind_rows(conf_int)
+
+kableExtra::kable(pc1_meta_results, format = 'html') %>% 
+  # kable_styling(bootstrap_options = c("striped", "hover")) %>% 
+  kable_classic() %>% 
+  row_spec(5, extra_css = "border-bottom: 2px solid black;")
+
+```
+
+
+
+## Meta-regression PC2
+
+### The average effect of post-pandemic times accessibility on property prices.
+
+```{r}
+# Meta-regression for PC2 
+meta_reg_pc2 <- coefficients %>%
+  filter(grepl("PC2", variable)) %>%
+  rma(
+    yi = coef_pandemic_interaction,
+    sei = se_pandemic_interaction,
+    mods = ~ 1 ,
+    data = .,
+    method = "ML"
+  )
+
+# Display summary and confidence intervals
+summary(meta_reg_pc2)
+```
+
+
+Confidence intervals
+```{r}
+confint(meta_reg_pc2)
+```
+
+
+
+
+
