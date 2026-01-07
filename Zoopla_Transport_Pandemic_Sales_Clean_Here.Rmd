@@ -1,0 +1,2735 @@
+---
+title: "Zoopla_Transport_Pandemic_Sales_Clean_Here"
+author: "Michail Georgiou"
+date: "2024-10-17"
+output: pdf_document
+---
+
+This script is to produce a clean version of the Zoopla Generation 2 datasets for Sales data and conduct an analysis on the housing market value of public transport accessibility in England post-pandemic.
+The analysis employs a Hedonic model with the use of public transport accessibility indicators devised by Verduzco Torres & McArthur (2024) (<https://www.nature.com/articles/s41597-023-02890-w#citeas>).
+
+In this script we use the "here" package.  
+
+A timeline of the COVID-19 pandemic measures for England can be found in "Table 1" here: <https://www.gov.uk/government/publications/the-impact-of-covid-19-lockdowns-on-crime-demand-and-charge-volumes/the-impact-of-covid-19-lockdowns-on-crime-demand-and-charge-volumes-in-england-and-wales#>:\~:text=06%2F01%2F2021,lockdown%20in%20England%20was%20announced
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install "remotes" package if not already installed
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+
+# Install the "AccessUK" package from Github
+remotes::install_github("urbanbigdatacentre/AccessUK")
+
+# Load the "AccessUK" package
+library("AccessUK")
+
+# load packages
+# install.packages("pacman")  # first time only
+pacman::p_load(feather, data.table, Rcpp, plm, lmtest, here, rlang, tidyverse,lubridate, sf, psych, patchwork, GGally,lme4,knitr,kableExtra,webshot2,ggrepel,tidymodels,viridis, lmerTest, rprojroot, reshape2, performance,RColorBrewer, scales, writexl, DHARMa)
+
+```
+
+#Zoopla Data Load
+
+The following chunk will load the Zoopla Generation 2 Sales dataset
+
+```{r data load}
+
+# Find the directory where this script is located
+script_dir <- dirname(rstudioapi::getSourceEditorContext()$path)
+
+# Set 'here' top directory to the script's location
+here::set_here(script_dir)
+
+# Store the path to the folder with the datasets
+folder_path <- here("Data", "Housing", "Zoopla")
+
+# List all files in the folder
+dataset_files <- list.files(path = folder_path, pattern = "zoopla-data-gen2-sale-valid-property-id-year-\\d{4}")
+
+# Function to read and process a single CSV file 
+read_and_process_csv <- function(file_name, folder_path) {
+  dataset_number <- as.integer(gsub("zoopla-data-gen2-sale-valid-property-id-year-|\\.csv", "", file_name))
+  dt <- data.table::fread(file.path(folder_path, file_name))
+  return(dt)
+}
+
+# Load and process each CSV file 
+data_tables <- lapply(dataset_files, function(file_name) {
+  data_table <- read_and_process_csv(file_name, folder_path)
+  return(data_table)
+})
+
+# Give names to the list elements
+names(data_tables) <- dataset_files
+
+```
+
+##Run this chunk separately to reduce time
+
+```{r data load rent valid id}
+# Combine all data tables into a single one
+combined_df <- rbindlist(data_tables)
+
+# Remove data_tables to save space
+rm(data_tables)
+
+# Convert to a data frame
+combined_df <- as.data.frame(combined_df)
+
+```
+
+#Zoopla Data Cleaning
+
+The following chunk will initiate data cleaning starting by removing duplicate entries.
+The duplicate entries exist because of the merge between datasets of different Zoopla years.
+Therefore some of the entries for listing IDs overlap.
+Here, among duplicates, we only keep the entries with the latest end_date.
+This is the closest we can get to keeping the most complete record of each listing.
+
+```{r duplicates removal}
+
+# Convert date columns to date format
+temp <- combined_df %>%
+  mutate(start_date = as.Date(start_date),
+         end_date = as.Date(end_date))
+
+# Identify duplicates for 'listing_id'
+duplicates <- temp %>%
+  group_by(listing_id) %>%
+  filter(n() > 1)
+
+# Sort within each group of duplicates by 'end_date' in descending order
+sorted_duplicates <- duplicates %>%
+  arrange(listing_id, desc(end_date))
+
+# Keep only the first row of each group of duplicates (latest end_date)
+final_duplicates <- sorted_duplicates %>%
+  distinct(listing_id, .keep_all = TRUE)
+
+# Combine with non-duplicates
+final_df <- bind_rows(final_duplicates, temp[!(temp$listing_id %in% final_duplicates$listing_id), ])
+
+# Clean up
+rm(duplicates,final_duplicates,sorted_duplicates,combined_df)
+
+```
+
+The following chunk performs various data cleaning operations (see titles for more details)
+
+```{r data cleaning}
+
+# Print the names of all columns in the dataset
+print(colnames(final_df))
+
+# Keep only columns of interest
+temp <- final_df %>%
+  select("listing_status", "listing_id", "post_town", "country", "county", "property_id", "address", "street_name", "property_number", "property_type", "furnished_state", "start_date", "end_date", "price_unique", "price_first", "price_last", "num_bed_first", "num_bed_last", "pcu_outcode", "pcu_incode", "pcu", "pcu_district", "pcu_sector", "latitude", "longitude", "category", "pcu_area", "lad20cd", "lad20nm")
+
+# Keep data for England only
+temp <- temp %>%
+  filter(country == "[\"\"England\"\"]")
+
+# Clean up
+rm (final_df)
+gc()
+
+# Remove properties of type that doesn't fall in the list below and create a new "property type" variable (Detached, Semi-detached, Terraced, Flat): 
+
+#Detached house --> Detached
+#Bungalow --> Detached
+#Link-detached house --> Detached 
+#Detached bungalow --> Detached
+#Cottage --> Detached
+#Barn conversion --> Detached
+#Mews house --> Detached
+#Semi-detached house --> Semi-detached
+#Semi-detached bungalow --> Semi-detached
+#Terraced house --> Terraced
+#End terrace house --> Terraced
+#Town house --> Terraced
+#Terraced bungalow --> Terraced
+#Flat --> Flat
+#Maisonette --> Flat
+#Studio --> Flat
+
+## Create a vector of property types of interest
+types_of_interest <- c(
+  "Detached house", "Bungalow", "Link-detached house", "Detached bungalow", 
+  "Cottage", "Barn conversion", "Mews house", "Semi-detached house", 
+  "Semi-detached bungalow", "Terraced house", "End terrace house", 
+  "Town house", "Terraced bungalow", "Flat", "Maisonette", "Studio"
+)
+
+## Create a vector to recode property types
+type_recoding <- c(
+  "Detached house" = "Detached",
+  "Bungalow" = "Detached",
+  "Link-detached house" = "Detached",
+  "Detached bungalow" = "Detached",
+  "Cottage" = "Detached",
+  "Barn conversion" = "Detached",
+  "Mews house" = "Detached",
+  "Semi-detached house" = "Semi-detached",
+  "Semi-detached bungalow" = "Semi-detached",
+  "Terraced house" = "Terraced",
+  "End terrace house" = "Terraced",
+  "Town house" = "Terraced",
+  "Terraced bungalow" = "Terraced",
+  "Flat" = "Flat",
+  "Maisonette" = "Flat",
+  "Studio" = "Flat"
+)
+
+## Filter and map property types
+temp <- temp %>%
+  filter(property_type %in% types_of_interest) %>%  
+  mutate(type_restricted = type_recoding[property_type])  
+
+# Remove entries where end_date <= start_date
+temp <- temp %>%
+  filter(start_date <= end_date)
+
+# Set pre-pandemic and post-pandemic periods (calendar years)
+# pre-pandemic period: 1 January 2018 to 31st December 2019
+# post-pandemic period: 1 January 2021 to 31st December 2022
+
+pre_pandemic_start <- as.Date("2018-01-01")
+pre_pandemic_end <- as.Date("2019-12-31")
+post_pandemic_start <- as.Date("2021-01-01")
+post_pandemic_end <- as.Date("2022-12-31")
+
+# Create dummy variable for pandemic period (0 = pre-pandemic, 1 = post-pandemic, NA = outside both)
+temp <- temp %>%
+  mutate(pandemic_period = case_when(
+    end_date >= post_pandemic_start & end_date <= post_pandemic_end ~ 1,
+    end_date >= pre_pandemic_start & end_date <= pre_pandemic_end ~ 0,
+    TRUE ~ NA_integer_
+  ))
+
+# Drop listings outside the pandemic period (NA values in pandemic_period variable)
+temp <- temp %>%
+  filter(!is.na(pandemic_period))
+
+# Create a new variable with the number of beds restricting the max number of beds to 4 (groups for 0,1,2,3,4 or more beds)
+temp <- temp %>%
+  mutate(
+    bed_restricted = case_when(
+      num_bed_last == 0 ~ 0,
+      num_bed_last == 1 ~ 1,
+      num_bed_last == 2 ~ 2,
+      num_bed_last == 3 ~ 3,
+      num_bed_last >= 4 ~ 4,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# Drop listings with price <= 0
+temp <- temp %>%
+  filter(price_last > 0)
+
+# Create columns to mark start and end year and month for each listing
+temp <- temp %>%
+  mutate(
+    start_year = year(ymd(start_date)),
+    end_year = year(ymd(end_date)),
+    start_month = month(ymd(start_date)),
+    end_month = month(ymd(end_date))
+  )
+
+# Create "nprice" column with the deflated sale prices (Years based on end date)
+
+# GDP deflator using base year 2022, dataset publicly available through the UK Government website: https://www.gov.uk/government/statistics/gdp-deflators-at-market-prices-and-money-gdp-december-2023-quarterly-national-accounts
+
+#2018	88.735
+#2019	90.612
+#2021	95.113
+#2022	100.000
+
+temp <- temp %>%
+  mutate(
+    nprice = case_when(
+      end_year == 2018 ~ price_last * (100 / 88.735),
+      end_year == 2019 ~ price_last * (100 / 90.612),
+      end_year == 2021 ~ price_last * (100 / 94.331),
+      end_year == 2022 ~ price_last * (100 / 100.000),
+    )
+  )
+
+# Create nprice_log variable for log(nprice)
+temp <- temp %>%
+  mutate(
+    nprice_log = log10(nprice))
+
+```
+
+# (OPTIONAL) Save a feather file named "zoopla_transp_sales_clean_final.feather" in the Zoopla folder for later use (OPTIONAL) 
+The following chunk is optional and can be used to save a .feather with the Zoopla data if the above process has been completed. 
+
+```{r zoopla save feather}
+
+# Save a feather file
+#write_feather(temp, here("Data", "Housing", "Zoopla", "zoopla_transp_sales_clean_final.feather"))
+
+```
+
+# (OPTIONAL) Load the Zoopla data from existing feather file (OPTIONAL)
+The following chunk is to be used only if the above process has already been completed and there is already a feather file named "zoopla_transp_sales_clean_final.feather" under the Zoopla folder.  
+
+``` {r zoopla feather load}
+
+# Load the feather file
+temp <- read_feather(here("data", "Housing" , "Zoopla", "zoopla_transp_sales_clean_final.feather"))
+
+```
+
+
+# Add LSOA geography to Zoopla Dataset using 2011 Census Geography boundaries (LSOAs)
+
+The following chunk adds LSOA 2011 using the 2011 Census Geography boundaries and longtitude/latitude variables for each listing in the Zoopla dataset .
+For the 2011 Census Geography boundaries (LSOAs) data we use the "infuse_lsoa_lyr_2011.shp" file available from <https://statistics.ukdataservice.ac.uk/dataset/2011-census-geography-boundaries-lower-layer-super-output-areas-and-data-zones>.
+
+The 2011 Census Georgraphy Boundaries (LSOAs) are in British National Grid (EPSG:27700).
+The Zoopla data use the longitude/latitude coordinate system (EPSG:4326).
+We convert the Zoopla data geography to British National Grid (EPSG:27700).
+
+```{r data link}
+
+# Read in file with 2011 Census Geography Boundaries (LSOA)
+lsoa_2011_bound_sf<-st_read(here("Data", "Geography", "LSOA Boundaries 2011 Census", "infuse_lsoa_lyr_2011.shp"))
+
+# Convert Zoopla data to spatial points (EPSG:4326)
+temp <- st_as_sf(temp, coords = c("longitude", "latitude"), crs = 4326)
+
+# Reproject Zoopla data to British National Grid (EPSG:4326 to EPSG:27700)
+temp <- st_transform(temp, crs = st_crs(lsoa_2011_bound_sf))
+
+# Add LSOA geography to Zoopla data
+temp <- st_join(temp, lsoa_2011_bound_sf, join = st_within)
+
+# Rename columns with lsoa code and name
+temp <- temp %>%
+  rename(lsoa2011_code = geo_code,
+         lsoa2011_name = geo_label)
+
+# Keep entries for English LSOAs only (lsoa2011_code starts with "E")
+temp <- temp %>%
+  filter(str_starts(lsoa2011_code, "E"))
+
+# Remove geo_labelw column (empty for English LSOAs)
+temp <- temp %>%
+  select(-geo_labelw)
+
+```
+
+#Add Travel To Work Areas geography to Zoopla Dataset using the "Lower Layer Super Output Area (2011) to Travel to Work Area (December 2011)" Lookup file
+
+The following chunk adds TTWA 2011 to each listing in the Zoopla dataset using the "Lower Layer Super Output Area (2011) to Travel to Work Area (December 2011) Lookup" file for each 2011 LSOA. 
+
+The "Lower Layer Super Output Area (2011) to Travel to Work Area (December 2011) Lookup" file is available from https://www.data.gov.uk/dataset/42472c45-76ad-4bcf-9b96-c91d8ae097f5/lower-layer-super-output-area-2011-to-travel-to-work-area-december-2011-lookup-in-the-united-kingdom 
+
+```{r data link 2}
+
+# Read in the TTWA to LSOA lookup file 
+ttwa2011_lsoa2011 <- fread(here("Data", "Geography", "LSOA 2011 to TTWA 2011 December", "lsoa2011_ttwa2011.csv"))
+
+# Remove the "ObjectId" and "LSOA11NM" columns
+ttwa2011_lsoa2011 <- ttwa2011_lsoa2011 %>%
+  select(-ObjectId, -LSOA11NM)
+
+# Add 2011 TTWA to the Zoopla listings data
+temp <- temp %>%
+   left_join(ttwa2011_lsoa2011, by = c("lsoa2011_code" = "LSOA11CD"))
+
+```
+
+#Add Local Authority District (May 2023) geography to Zoopla Dataset Local Authority District boundaries (May 2023) (LAD23CDs)
+
+The following chunk adds Local Authority Districts 2023 using the May 2023 LAD Geography boundaries and longtitude/latitude variables for each listing in the Zoopla dataset .
+For the May 2023 LAD Geography boundaries (LAD23CDs) data we use the "LAD_MAY_2023_UK_BGC_V2.shp" file available from https://geoportal.statistics.gov.uk/datasets/1292e3031e214641a023012a8fae2afa/explore . 
+
+The 2023 Local Authority District Boundaries (LAD23CDs) are in British National Grid (EPSG:27700).
+The Zoopla data use the longitude/latitude coordinate system (EPSG:4326).
+We have already converted the Zoopla data geography to British National Grid (EPSG:27700).
+
+```{r data link 3}
+
+# Read in file with 2011 Census Geography Boundaries (LSOA)
+lad_2023_bound_sf<-st_read(here("Data", "Geography", "LAD May 2023 Boundaries", "LAD_MAY_2023_UK_BGC_V2.shp"))
+
+# Keep LADs in England (LAD23CD starts with "E")
+lad_2023_bound_sf <- lad_2023_bound_sf %>%
+  filter(str_starts(LAD23CD, "E"))
+
+# Keep only columns of interest
+lad_2023_bound_sf <- lad_2023_bound_sf %>%
+  select(LAD23CD,LAD23NM)
+
+# Add LSOA geography to Zoopla data
+temp <- st_join(temp, lad_2023_bound_sf, join = st_within)
+
+```
+
+#Travel To Work (TTW) by mode and occupation 
+The following chunk brings in TTW information by mode and occupation at LSOA level.
+
+File uses LSOAs 2021, but will be converted to LSOAs 2011 for consistency with other datasets.
+The initial file can be downloaded from: <https://www.ons.gov.uk/datasets/RM079/editions/2021/versions/4/filter-outputs/8678fab5-d44d-409d-adbc-0ccabcc3fc52#get-data>.
+We use the univariate tables.
+For mode of transport to work we use the variable with 5 categories.
+For occupation we use the variable with 10 categories.
+
+To move from LSOA 2021 to LSOA 2011 geography we use the 'LSOA (2011) to LSOA (2021) to Local Authority District (2022) Lookup for England and Wales (Version 2)' file which can be downloaded from <https://geoportal.statistics.gov.uk/search?q=LUP_LSOA_2021_LAD&sort=Date%20Created%7Ccreated%7Cdesc>.
+
+There is a CHGIND variable in the lookup file which indicates changes on the move from LSOA11CD to LSOA21CD.
+The variable is described here <https://ckan.publishing.service.gov.uk/dataset/lsoa-2011-to-lsoa-2021-to-local-authority-district-2022-lookup-for-england-and-wales-version-21> and below:
+
+U - No Change from 2011 to 2021.
+This means that direct comparisons can be made between these 2011 and 2021 LSOA.
+S - Split.
+This means that the 2011 LSOA has been split into two or more 2021 LSOA.
+M - Merged.
+2011 LSOA have been merged with another one or more 2011 LSOA to form a single 2021 LSOA.
+X - The relationship between 2011 and 2021 LSOA is irregular and fragmented.
+No comparison between estimates for 2011 and 2021 are possible.
+
+To jump back to 2011 LSOAs, processing here is based on the CHGIND variable and goes as follows:
+
+Merge (CHGIND == "M"):
+
+For each LSOA21CD and per occupation, we distribute the observation number equally among the constituent LSOA11CDs.
+
+Split (CHGIND == "S"):
+
+For each LSOA11CD and per occupation, observations from the multiple LSOA21CDs split are aggregated into one sum for the one LSOA11CD.
+
+Irregular or Fragmented (CHGIND == "X"):
+
+Removed from the dataset.
+No comparisons are possible for estimates for 2011 and 2021.
+
+No Change (CHGIND == "U"):
+
+For each LSOA11CD and per occupation, observations from the corresponding LSOA21CDs are retained as is.
+
+##Read in files and convert TTW data from LSOA21CDs to LSOA11CDs
+
+```{r data TTW}
+# Read in the TTW data by occupation (ttw_occup dataset)
+ttw_occup <- fread(here("Data", "Homeworking", "Travel to Work", "TTW_occ_2021.csv"))
+
+#Occupation Categories:
+  #Managers, directors and senior officials (1)
+  #Professional occupations (2)
+  #Associate professional and technical occupations (3)
+  #Administrative and secretarial occupations (4)
+  #Skilled trades occupations (5)
+  #Caring, leisure and other service occupations (6)
+  #Sales and customer service occupations (7)
+  #Process, plant and machine operatives (8)
+  #Elementary occupations (9)
+  #Does not apply (10)
+
+# Rename columns in the ttw_occ dataset (ttw_occup dataset)
+ttw_occup <- ttw_occup %>%
+  rename(LSOA21CD = "Lower layer Super Output Areas Code",
+         LSOA21NM = "Lower layer Super Output Areas",
+         OCCUPCD = "Occupation (current) (10 categories) Code",
+         OCCUPNM = "Occupation (current) (10 categories)")
+
+# Remove entries for OCCUPCD = -8 ("does not apply" occupation category) (ttw_occup dataset)
+ttw_occup <- ttw_occup %>%
+  filter(!OCCUPCD == "-8") 
+
+# Read in the LSOA2021 to LSOA2011 Lookup file
+lsoa2021_lsoa_2011 <- fread(here("Data", "Homeworking", "Travel to Work", "LSOA_(2011)_to_LSOA_(2021)_Lookup_England_Wales.csv"))
+
+# Keep only necessary columns 
+lsoa2021_lsoa_2011 <- lsoa2021_lsoa_2011 %>%
+  select(LSOA11CD, LSOA11NM, LSOA21CD, CHGIND)
+
+# Merge the ttw_occup dataset with the look up file to bring in the LSOA11CDs (ttw_occup dataset)
+ttw_occup <- merge(ttw_occup, lsoa2021_lsoa_2011, by = "LSOA21CD", all.x = TRUE)
+
+# Remove entries for LSOA11CDs that were "irregularly fragmented" and no direct comparison to LSOA21CDs is possible (ttw_occup dataset)
+ttw_occup <- ttw_occup %>%
+  filter(!CHGIND == "X")
+
+# Create separate dataframes for different CHGIND values, rename "Observation" to "Observation_LSOA21CD", add new "Observation_LSOA11CD" (ttw_occup dataset)
+unchanged_ttw_occup <- ttw_occup %>%
+  filter(CHGIND == "U") %>%
+  rename(Observation_LSOA21CD = Observation) %>%
+  mutate(Observation_LSOA11CD = NA)
+
+split_ttw_occup <- ttw_occup %>%
+  filter(CHGIND == "S") %>%
+  rename(Observation_LSOA21CD = Observation) %>%
+  mutate(Observation_LSOA11CD = NA)
+
+merged_ttw_occup <- ttw_occup %>%
+  filter(CHGIND == "M") %>%
+  rename(Observation_LSOA21CD = Observation) %>%
+  mutate(Observation_LSOA11CD = NA)
+
+# For unchanged 2011 LSOAs, Observation_LSOA11CD = Observation_LSOA11CD (ttw_occup dataset)
+unchanged_ttw_occup <- unchanged_ttw_occup %>%
+  mutate(Observation_LSOA11CD = Observation_LSOA21CD) %>%
+  select(LSOA11CD,LSOA11NM,OCCUPCD,OCCUPNM,Observation_LSOA11CD)
+
+# For split 2011 LSOAs, aggregate the observation numbers of the multiple LSOA21CDs back to the original LSOA11CD (ttw_occup dataset)
+split_ttw_occup <- split_ttw_occup %>%
+  group_by(LSOA11CD, OCCUPCD, OCCUPNM, LSOA11NM) %>%
+  summarise(Observation_LSOA11CD = sum(Observation_LSOA21CD))
+
+# For merged 2011 LSOAs, revert the merge by distributing the number of observations, per occupation, of each LSOA21CD to its constituent LSOA11CDs equally. Numbers are rounded to avoid decimals. (ttw_occup dataset)
+merged_ttw_occup <- merged_ttw_occup %>%
+  group_by(OCCUPCD, OCCUPNM, LSOA21CD) %>%
+  mutate(
+    Count_LSOA11CDs = n_distinct(LSOA11CD),
+    Observation_LSOA11CD = round(Observation_LSOA21CD / Count_LSOA11CDs)
+  ) %>%
+  ungroup() %>%
+  select(LSOA11CD, LSOA11NM, OCCUPCD, OCCUPNM, Observation_LSOA11CD)
+
+# Bind rows for the ttw_occup back together from the new datasets with the observation numbers for LSOA11CDs (ttw_occup dataset)
+ttw_occup <- bind_rows(unchanged_ttw_occup,merged_ttw_occup,split_ttw_occup)
+
+# Read in the TTW data by mode of travel (ttw_mode dataset)
+ttw_mode <- fread(here("Data", "Homeworking", "Travel to Work", "TTW_mode_2021.csv"))
+
+#Mode of TTW Categories:
+  #Work mainly at or from home (1)
+  #Train, underground, metro, light rail, tram, bus, minibus or coach (2)
+  #Driving a car or van (3)
+  #All other methods of travel to work (4)
+  #Not in employment or aged 15 years and under (5)
+
+# Rename columns in the ttw_mode dataset (ttw_mode dataset)
+ttw_mode <- ttw_mode %>%
+  rename(LSOA21CD = "Lower layer Super Output Areas Code",
+         LSOA21NM = "Lower layer Super Output Areas",
+         TTWMETHODCD = "Method used to travel to workplace (5 categories) Code",
+         TTWMETHODNM = "Method used to travel to workplace (5 categories)")
+
+# Remove entries for TTWMETHODCD = -5 ("Not in employment or aged 15 years and under " TTW mode category) (ttw_mode dataset)
+ttw_mode <- ttw_mode %>%
+  filter(!TTWMETHODCD == "5") 
+
+# Merge the ttw_mode dataset with the look up file to bring in the LSOA11CDs (ttw_mode dataset)
+ttw_mode <- merge(ttw_mode, lsoa2021_lsoa_2011, by = "LSOA21CD", all.x = TRUE)
+
+# Remove entries for LSOA11CDs that were "irregularly fragmented" and no direct comparison to LSOA21CDs is possible (ttw_mode dataset)
+ttw_mode <- ttw_mode %>%
+  filter(!CHGIND == "X")
+
+# Create separate dataframes for different CHGIND values, rename "Observation" to "Observation_LSOA21CD", add new "Observation_LSOA11CD" (ttw_mode dataset)
+unchanged_ttw_mode <- ttw_mode %>%
+  filter(CHGIND == "U") %>%
+  rename(Observation_LSOA21CD = Observation) %>%
+  mutate(Observation_LSOA11CD = NA)
+
+split_ttw_mode <- ttw_mode %>%
+  filter(CHGIND == "S") %>%
+  rename(Observation_LSOA21CD = Observation) %>%
+  mutate(Observation_LSOA11CD = NA)
+
+merged_ttw_mode <- ttw_mode %>%
+  filter(CHGIND == "M") %>%
+  rename(Observation_LSOA21CD = Observation) %>%
+  mutate(Observation_LSOA11CD = NA)
+
+# For unchanged 2011 LSOAs, Observation_LSOA11CD = Observation_LSOA11CD (ttw_mode dataset)
+unchanged_ttw_mode <- unchanged_ttw_mode %>%
+  mutate(Observation_LSOA11CD = Observation_LSOA21CD) %>%
+  select(LSOA11CD,LSOA11NM,TTWMETHODCD,TTWMETHODNM,Observation_LSOA11CD)
+
+# For split 2011 LSOAs, aggregate the observation numbers of the multiple LSOA21CDs back to the original LSOA11CD (ttw_mode dataset)
+split_ttw_mode <- split_ttw_mode %>%
+  group_by(LSOA11CD, TTWMETHODCD, TTWMETHODNM, LSOA11NM) %>%
+  summarise(Observation_LSOA11CD = sum(Observation_LSOA21CD))
+
+# For merged 2011 LSOAs, revert the merge by distributing the number of observations, per mode of travel, of each LSOA21CD to its constituent LSOA11CDs equally. Numbers are rounded to avoid decimals. (ttw_mode dataset)
+merged_ttw_mode <- merged_ttw_mode %>%
+  group_by(TTWMETHODCD, TTWMETHODNM, LSOA21CD) %>%
+  mutate(
+    Count_LSOA11CDs = n_distinct(LSOA11CD),
+    Observation_LSOA11CD = round(Observation_LSOA21CD / Count_LSOA11CDs)
+  ) %>%
+  ungroup() %>%
+  select(LSOA11CD, LSOA11NM, TTWMETHODCD, TTWMETHODNM, Observation_LSOA11CD)
+
+# Bind rows for the ttw_mode back together from the new datasets with the observation numbers for LSOA11CDs (ttw_mode dataset)
+ttw_mode <- bind_rows(unchanged_ttw_mode,merged_ttw_mode,split_ttw_mode)
+
+# Clean up
+rm(merged_ttw_mode,merged_ttw_occup,split_ttw_mode,split_ttw_occup,unchanged_ttw_mode,unchanged_ttw_occup)
+
+```
+
+##Create a variable for propensity score of homeworking per occupation for each LSOA 
+This is using data on homeworking only and hybrid working from (Figure 4: Professionals were most likely to report home or hybrid working)
+https://www.ons.gov.uk/employmentandlabourmarket/peopleinwork/employmentandemployeetypes/articles/characteristicsofhomeworkersgreatbritain/september2022tojanuary2023#characteristics-of-homeworkers-great-britain-data>
+The high/low category variable and its dummy are calculated within each TTWA. 
+
+```{r data propensity}
+# Create a dataframe with homeworking percentages for each occupation code 
+
+#                                        	        Homeworking or Hybrid working (%)
+#Managers Directors and Senior Officials (1)            	          64
+#Professional occupations (2)	                                      71
+#Associate professional occupations (3)	                            61
+#Administrative and secretarial occupations (4)	    		            51
+#Skilled trades occupations (5)	                                    16
+#Caring leisure and other service occupations (6)	                  14
+#Sales and customer service occupations (7)	                        20
+#Process plant and machine operatives (8)	                          10
+#Elementary occupations (9)	                                        4
+
+occupation_hw_perc <- data.frame(
+  OCCUPCD = c(1, 2, 3, 4, 5, 6, 7, 8, 9),
+  Occup_hw_perc = c(0.64, 0.71, 0.61, 0.51, 0.16, 0.14, 0.2, 0.1, 0.04)
+)
+
+# Merge TTW dataset with dataframe of homeworking percentages per occupation code
+ttw_occup <- left_join(ttw_occup, occupation_hw_perc, by = "OCCUPCD")
+
+# Find number of homeworkers in each LSOA11CD per occupation (no decimals)
+ttw_occup <- ttw_occup %>%
+  mutate(Occup_hw_no = round(Occup_hw_perc * Observation_LSOA11CD))
+
+# Find the total number of homeworkers and total number of working people in each LSOA11CD across all occupations
+propensity_by_lsoa_all_occ <- ttw_occup %>%
+  group_by(LSOA11CD) %>%
+  summarise(Total_Working_From_Home = sum(Occup_hw_no),
+            Total_People = sum(Observation_LSOA11CD))
+
+# Calculate the percentage of homeworkers among all OCCUPCDs in each LSOA11CD (propensity of homeworking)
+propensity_by_lsoa_all_occ <- propensity_by_lsoa_all_occ %>%
+  mutate(Propens_hw_LSOA = Total_Working_From_Home / Total_People) %>%
+  select(-Total_Working_From_Home,-Total_People)
+
+# Add TTWAs in dataframe from TTWA to LSOA lookup file
+propensity_by_lsoa_all_occ_with_ttwa <- propensity_by_lsoa_all_occ %>%
+  left_join(ttwa2011_lsoa2011, by = "LSOA11CD")
+
+# Calculate median propensity to homeworking within each TTWA
+median_propensity_hw_by_ttwa <- propensity_by_lsoa_all_occ_with_ttwa %>%
+  group_by(TTWA11CD) %>%
+  summarize(ttwa_median_Propens_hw = median(Propens_hw_LSOA, na.rm = TRUE))
+
+# Add the variable with the median propensity to homeworking within each TTWA back to the dataset
+propensity_with_median_ttwa <- propensity_by_lsoa_all_occ_with_ttwa %>%
+  left_join(median_propensity_hw_by_ttwa, by = "TTWA11CD")
+
+# Create dummy variable for high/low propensity to homeworking for each LSOA (above/below median within corresponding TTWA)
+#Dummy here is 0 for low propensity to homeworking and 1 for high propensity to homeworking
+propensity_with_median_ttwa <- propensity_with_median_ttwa %>%
+  mutate(Propens_hw_LSOA_category = ifelse(Propens_hw_LSOA > ttwa_median_Propens_hw, "High", "Low"),
+    Propens_hw_LSOA_category_dummy = ifelse(Propens_hw_LSOA > ttwa_median_Propens_hw, 1, 0))
+
+# Add propensity of homeworkers variable to the Zoopla dataset
+temp <- merge(temp, propensity_with_median_ttwa %>% select(-TTWA11CD,-TTWA11NM), by.x = "lsoa2011_code", by.y = "LSOA11CD", all.x = TRUE)
+
+```
+
+# Create a variable with the percentage of people travelling to work by public transport for each LSOA, among working people
+
+Here we use the ttw_mode dataset as editted in previous code chunks. The high/low category variable and its dummy are calculated within each TTWA. 
+
+```{r data pt percentage}
+# Calculate the percentage of people using Public Transport to travel to work in each LSOA
+  #Public Transport => TTWMETHOD == 2 (Train, underground, metro, light rail, tram, bus, minibus or coach)
+percentage_by_lsoa_pt_mode <- ttw_mode %>%
+  filter(TTWMETHODCD == 2) %>%
+  group_by(LSOA11CD) %>%
+  summarise(Total_Public_Transport = sum(Observation_LSOA11CD)) %>%
+  left_join(ttw_mode %>% 
+              group_by(LSOA11CD) %>%
+              summarise(Total_Observations = sum(Observation_LSOA11CD)), by = "LSOA11CD") %>%
+  mutate(Mode_pt_perc = Total_Public_Transport / Total_Observations) %>%
+  select(LSOA11CD, Mode_pt_perc)
+
+# Add TTWAs in dataframe from TTWA to LSOA lookup file
+percentage_by_lsoa_pt_mode_with_ttwa <- percentage_by_lsoa_pt_mode %>%
+  left_join(ttwa2011_lsoa2011, by = "LSOA11CD")
+
+# Calculate median percentage of people travelling to work by PT within each TTWA
+median_pt_perc_by_ttwa <- percentage_by_lsoa_pt_mode_with_ttwa %>%
+  group_by(TTWA11CD) %>%
+  summarize(ttwa_median_Mode_pt_perc = median(Mode_pt_perc, na.rm = TRUE))
+
+# Add the variable with the median percentage of people travelling to work by PT within each TTWA back to the dataset
+percentage_with_median_ttwa <- percentage_by_lsoa_pt_mode_with_ttwa %>%
+  left_join(median_pt_perc_by_ttwa, by = "TTWA11CD")
+
+# Create dummy variable for high/low percentage of people travelling to work by PT for each LSOA (above/below median within corresponding TTWA)
+#Dummy here is 0 for low percentage of people travelling to work by PT and 1 for high percentage of people travelling to work by PT
+percentage_with_median_ttwa <- percentage_with_median_ttwa %>%
+  mutate(Mode_pt_perc_category = ifelse(Mode_pt_perc > ttwa_median_Mode_pt_perc, "High", "Low"),
+    Mode_pt_perc_category_dummy = ifelse(Mode_pt_perc > ttwa_median_Mode_pt_perc, 1, 0))
+
+# Add percentage of working people travelling to work by public transport variable to the Zoopla dataset
+temp <- merge(temp, percentage_with_median_ttwa %>% select(-TTWA11CD,-TTWA11NM), by.x = "lsoa2011_code", by.y = "LSOA11CD", all.x = TRUE)
+
+```
+
+# Create a population density variable for each 2011 LSOA
+The following chunk uses adds a population density variable for each 2011 LSOA using the "Mid-2020: SAPE23DT11" dataset available online from https://www.ons.gov.uk/peoplepopulationandcommunity/populationandmigration/populationestimates/datasets/lowersuperoutputareapopulationdensity. We manually create a csv keeping only the population density data tab of the original excel file, before importing here. The population density variable is measured in "People per Sq Km" and has been calculated using the following formula: pop_dens = Mid-2020 population/Area Sq Km
+
+```{r data pop_dens}
+# Read in the csv file with mid-2020 population density data
+pop_dens_2020_lsoa <- fread(here("Data", "Geography", "LSOA Population Density 2020", "pop_dens_2020_lsoa11.csv"))
+
+# Keep only necessary columns
+pop_dens_2020_lsoa <- pop_dens_2020_lsoa %>%
+  select("LSOA Code", "Mid-2020 population", "People per Sq Km") 
+
+# Rename columns 
+pop_dens_2020_lsoa <- pop_dens_2020_lsoa %>%
+  rename(lsoa2011_code = "LSOA Code",
+        pop_2020 = "Mid-2020 population",
+        pop_dens = "People per Sq Km")
+
+# Merge the population density dataset with the Zoopla property listings dataset
+temp <- merge(temp, pop_dens_2020_lsoa, by = "lsoa2011_code", all.x = TRUE )
+
+```
+
+# Add a population variable for each TTWA 
+The following chunk adds a population variable for each 2011 TTWA using the "Mid-2020: SAPE23DT11" dataset for population density available online from https://www.ons.gov.uk/peoplepopulationandcommunity/populationandmigration/populationestimates/datasets/lowersuperoutputareapopulationdensity. There is a population variable for Mid-2020 for each 2011 LSOA in this dataset. We use the Mid-2020 LSOA population and the The "Lower Layer Super Output Area (2011) to Travel to Work Area (December 2011) Lookup" file is available from https://www.data.gov.uk/dataset/42472c45-76ad-4bcf-9b96-c91d8ae097f5/lower-layer-super-output-area-2011-to-travel-to-work-area-december-2011-lookup-in-the-united-kingdom . We calculate aggregate the population data for LSOAs to get the total population for each TTWA. 
+
+``` {r data pop_2020_ttwa}
+
+# Merge the TTWA to LSOA lookup file with the Mid-2020 LSOA population data from population density
+ttwa_pop <- merge(ttwa2011_lsoa2011, pop_dens_2020_lsoa, by.x = "LSOA11CD", by.y = "lsoa2011_code")
+
+# Convert population variable to numeric
+ttwa_pop <- ttwa_pop %>%
+  mutate(pop_2020 = as.numeric(gsub(",", "", pop_2020)))
+
+# Keep TTWAs in England (TTWA11CD starts with "E")
+ttwa_pop <- ttwa_pop %>%
+  filter(str_starts(TTWA11CD, "E"))
+
+# Aggregate Mid-2020 population by TTWA
+ttwa_pop_agg <- ttwa_pop %>%
+  group_by(TTWA11CD) %>%
+  summarise(ttwa_pop_2020 = sum(pop_2020))
+
+# Calculate the median population
+median_pop <- median(ttwa_pop_agg$ttwa_pop_2020)
+
+# Create bands for TTWA population based on the median
+ttwa_pop_agg <- ttwa_pop_agg %>%
+  mutate(ttwa_pop_2020_band = ifelse(ttwa_pop_2020 > median_pop, "Large", "Small"))
+
+# Add TTWA Mid-2020 population to the Zoopla listings data
+temp <- temp %>%
+  left_join(ttwa_pop_agg, by = c("TTWA11CD" = "TTWA11CD"))
+
+```
+
+# Create a variable with the percentage of people travelling to work by public transport for each TTWA, among working people
+
+Here we use the ttw_mode dataset as editted in previous code chunks. We calculate the percentage of people using public transport to travel to work for each TTWA from the same data for LSOAs. We use a weighted mean based on the size (population) of LSOAs within TTWAs. 
+
+``` {r pt percentage ttwa}
+
+# Merge the percentage of people traveling by public transport in each LSOA with the population density data
+percentage_by_lsoa_pt_mode <- percentage_by_lsoa_pt_mode %>%
+  left_join(pop_dens_2020_lsoa, by = c("LSOA11CD" = "lsoa2011_code"))
+
+# Bring in the TTWA to LSOA lookup file to get the corresponding TTWA for each LSOA
+percentage_by_lsoa_pt_mode <- percentage_by_lsoa_pt_mode %>%
+  left_join(ttwa2011_lsoa2011, by = "LSOA11CD")
+
+# Convert population variable to numeric
+percentage_by_lsoa_pt_mode <- percentage_by_lsoa_pt_mode %>%
+  mutate(pop_2020 = as.numeric(gsub(",", "", pop_2020)))
+
+# Calculate a weighted mean of % Use of PT for employment for each TTWA using the LSOA population as weights
+percentage_by_ttwa_pt_mode <- percentage_by_lsoa_pt_mode %>%
+  group_by(TTWA11CD) %>%
+  summarise(TTWA_Mode_pt_perc = sum(Mode_pt_perc * pop_2020, na.rm = TRUE) / sum(pop_2020, na.rm = TRUE))
+
+# Add TTWA percentage of working people travelling to work by public transport to Zoopla dataset
+temp <- temp %>%
+  left_join(percentage_by_ttwa_pt_mode, by = c("TTWA11CD" = "TTWA11CD"))
+
+```
+
+# Create a housing affordability variable for each Local Authority 
+The following chunk adds a housing affordability in 2023 variable for each Local Authority using the "House price to workplace-based earnings ratio" dataset available online from https://www.ons.gov.uk/peoplepopulationandcommunity/housing/datasets/ratioofhousepricetoworkplacebasedearningslowerquartileandmedian. We manually create a csv keeping only the housing affordability ratio by local authority data tab (5c) of the original excel file, before importing here. The housing affordability variable has been calculated using the following formula Housing_affordability = Median House Price/Work-based earnings. 
+A higher ratio indicates that on average, it is less affordable for a worker to purchase a house in their local authority district. Conversely, a lower ratio indicates higher affordability in a local authority. 
+
+```{r data pop_dens}
+# Read in the csv file with the housing affordability data
+ha_2023_la <- fread(here("Data", "Housing Affordability", "Housing Affordability Ratio", "Ratio_of_House_Price_to_Workplace_Based_Earnings_2023_Only.csv"))
+
+# Keep only necessary columns
+ha_2023_la <- ha_2023_la %>%
+  select(-"Local authority name")
+
+# Rename columns 
+ha_2023_la <- ha_2023_la %>%
+  rename("LAD23CD" = "Local authority code",
+         "ha_2023_ratio" = "2023 Ratio")
+
+# Add NA where data is not available
+ha_2023_la <- ha_2023_la %>%
+  mutate(
+    ha_2023_ratio = case_when(
+      ha_2023_ratio == "[x]" ~ NA,
+      TRUE ~ ha_2023_ratio
+    )
+  )
+
+# Remove any NA or blank rows (1 blank/1 NA)
+ha_2023_la <- ha_2023_la %>%
+  filter(!ha_2023_ratio == "")
+
+# Convert ha_2023_ratio to numeric
+ha_2023_la <- ha_2023_la %>%
+  mutate(ha_2023_ratio = as.numeric(ha_2023_ratio))
+
+# Merge the housing affordability dataset dataset with the Zoopla property listings dataset
+temp <- merge(temp, ha_2023_la, by = "LAD23CD", all.x = TRUE )
+
+```
+
+# Create a housing affordability variable for each TTWA (population-based)
+Here we calculate a housing affordability variable for each 2011 TTWA using the 2023 data for Local Authorities from https://www.ons.gov.uk/peoplepopulationandcommunity/housing/datasets/ratioofhousepricetoworkplacebasedearningslowerquartileandmedian 
+We create a lookup table through a spatial join between LSOAs 2011, Local Authority Districts 2023 and Travel to Work Areas 2011. We then add calculate the population of each LA and its share in the population of each TTWA. Using this, we then calculate a population-weighted housing affordability for each TTWA. 
+ 
+```{r data ha 2023 ttwa}
+
+# Use the LAD23CD shapefile (already in environment)
+lad_2023_bound_sf <- lad_2023_bound_sf %>%
+  select(LAD23CD,LAD23NM)
+
+# Read the TTWA11CD shapefile
+ttwa_2011_bound_sf <- st_read(here("Data", "Geography", "TTWA Boundaries December 2011 BGC", "TTWA_2011_UK_BGC_V3.shp")) %>%
+  select(TTWA11CD, TTWA11NM)
+
+# Create an LSOA11 to LAD23 to TTWA11 lookup table with lsoa population numbers
+lsoa_lad_ttwa <- lsoa_2011_bound_sf %>%
+    st_join(lad_2023_bound_sf %>% select(LAD23CD)) %>%
+    st_join(ttwa_2011_bound_sf) %>%
+    left_join(
+        pop_dens_2020_lsoa %>%
+            rename(geo_code = lsoa2011_code, pop_2020 = pop_2020) %>%
+            mutate(pop_2020 = as.numeric(gsub(",", "", pop_2020))),
+        by = "geo_code"
+    ) %>%
+    rename(population = pop_2020)
+
+# Calculate the population of each LA within each TTWA
+la_ttwa_pop <- lsoa_lad_ttwa %>%
+    st_drop_geometry() %>%
+    group_by(LAD23CD, TTWA11CD, TTWA11NM) %>%
+    summarise(pop_la_ttwa = sum(population, na.rm = TRUE), .groups = "drop")
+
+# Calculate the total population of each TTWA
+la_ttwa_pop <- la_ttwa_pop %>%
+    group_by(TTWA11CD, TTWA11NM) %>%
+    mutate(
+        pop_ttwa = sum(pop_la_ttwa, na.rm = TRUE),
+        pop_la_ttwa_share = pop_la_ttwa / pop_ttwa
+    ) %>%
+    ungroup()
+
+# Bring in the housing affordability data and calculate the contribution of each LA to the affordability ratio of each TTWA
+la_ttwa_pop <- la_ttwa_pop %>%
+    left_join(ha_2023_la, by = "LAD23CD") %>%
+    mutate(afford_la_ttwa = ha_2023_ratio * pop_la_ttwa_share)
+
+# Calculate population weighted housing affordability for each TTWA
+ttwa_affordability <- la_ttwa_pop %>%
+    group_by(TTWA11CD, TTWA11NM) %>%
+    summarise(ha_2023_ratio_ttwa = sum(afford_la_ttwa, na.rm = TRUE), .groups = "drop")
+
+# Keep only TTWAs in England
+ttwa_affordability <- ttwa_affordability %>%
+  filter(str_starts(TTWA11CD, "E"))
+
+# Calculate the median ha ratio for TTWAs
+median_ha_ttwa <- median(ttwa_affordability$ha_2023_ratio_ttwa, na.rm = TRUE)
+
+# Create housing affordability bands for TTWAs based on the median housing affordability ratio across all TTWAs
+ttwa_affordability <- ttwa_affordability %>%
+  mutate(ttwa_ha_2023_ratio_band = ifelse(ha_2023_ratio_ttwa > median_ha_ttwa, "Low Housing Affordability", "High Housing Affordability"))
+
+# Add housing affordability variables for TTWAs to Zoopla data
+temp <- temp %>%
+  left_join(ttwa_affordability %>%
+              select(-TTWA11NM), by = "TTWA11CD")
+
+```
+
+# Zoopla data link to Public Transport Accessibility Indicators 
+##Bring in the Public Transport Accessibility Indicators 2022 
+
+The following chunk brings in the Public Transport Accessibility Indicators 2022 for each LSOA in the LSOA11CD column in the Zoopla dataset.
+Here we use the 'AccessUK' package developed by Jose Rafael Verduzco-Torres (2023).
+The package can be downloaded and installed from <https://github.com/urbanbigdatacentre/AccessUK>
+
+```{r data PTAIs link}
+
+# Read in data for access to all types of employment by public transport 
+access_employment_all_pt <- get_accessibility(temp$lsoa2011_code, "employment", "public_transport")
+
+# Keep only columns of interest
+access_employment_all_pt <- access_employment_all_pt %>%
+  select(-geo_label)
+
+# Keep columns only for cumulative PTAIs
+access_employment_all_pt <- access_employment_all_pt %>%
+  select("geo_code", "employment_15", "employment_30", "employment_45","employment_60", "employment_75", "employment_90", "employment_105", "employment_120")
+
+```
+
+##Create Principal Components for Transport Accessibility Indicators and Tables A1, A2
+The following chunk creates 'Principal Component' variables. This is to reduce the number of the original variables to a set of 2 new variables, keeping their variation. We first standardise the data to avoid large numbers disproportionately affecting the analysis. Then, we use the 'psych' package which has a simple Principal Component Analysis (PCA) functionality. 
+
+```{r data pcPTAI}
+
+# Standardise the PTAIs data using the 'scale' function removing the "geo_code" column for this operation
+access_employment_all_pt_scaled <- scale(access_employment_all_pt[, !(names(access_employment_all_pt) %in% c("geo_code"))])
+
+# Perform the Principal Components Analysis (PCA) for all variables
+pca_all <- principal(access_employment_all_pt_scaled, nfactors = 8, rotate = "none")
+
+# Print the table with the variance explained for each principal component, cumulative variance
+print(pca_all[["Vaccounted"]])
+
+# Keep only 2 Principal Components (PCs). The cumulative variance explained by the 2 PCs is 0.9044236.
+pca_2 <- principal(access_employment_all_pt_scaled, nfactors = 2, rotate = "none")
+
+# Print the table with the variance explained for each principal component, cumulative variance and loadings
+print(pca_2[["Vaccounted"]])
+print(pca_2[["weights"]])
+
+# Save the variance accounted and weights tables
+write.csv(pca_2[["Vaccounted"]], file = here("outputs", "Table1_variance_accounted.csv"), row.names = TRUE)
+write.csv(pca_2[["weights"]], file = here("outputs", "Table2_weights.csv"), row.names = TRUE)
+
+# Add PCAs to the PTAIs dataset
+access_employment_all_pt_pca <- predict(pca_2, access_employment_all_pt_scaled)
+access_employment_all_pt <- cbind(access_employment_all_pt, access_employment_all_pt_pca)
+
+# Clean up
+rm(access_employment_all_pt_pca, access_employment_all_pt_scaled, pca_2, pca_all)
+
+# Merge PTAIs dataset with the Zoopla property listings dataset
+temp <- merge(temp, access_employment_all_pt, by.x = "lsoa2011_code", by.y = "geo_code" )
+
+```
+
+# Modelling (Many Models/LME4)
+Here we create models to investigate the relationships between all variables and the impact of the pandemic on the effect of public transport accessibility for employment on rents for England across a set of TTWAs (those with over 6000 listings over all four years) (N=74). 
+We use the Many Models approach as described here https://r4ds.had.co.nz/many-models.html. 
+This approach runs a separate model for each TTWA. Here we use lmer from the lme4 package. 
+
+## Create a dataset with a number of TTWAs in England for the "Many Models" analysis
+Here we firstly create the dataset to be used in the "Many Models" approach. 
+
+``` {r data manymodels}
+
+# Create a dataset "england_listings" and convert pop_dens to numeric
+england_listings_mm <- temp %>%
+  mutate(pop_dens = as.numeric(gsub(",", "", pop_dens)))
+
+# Create a dummy variable for HW propensity PT use together (Propens_hw_LSOA_category_dummy*Mode_pt_perc_category_dummy)
+#This is ‘1’ for both high propensity to HW and high PT use
+england_listings_mm <- england_listings_mm %>%
+  mutate(HW_PT_category_dummy = Propens_hw_LSOA_category_dummy*Mode_pt_perc_category_dummy)
+
+# Convert relevant variables to factors
+england_listings_mm <- england_listings_mm %>%
+  mutate(bed_restricted = factor(bed_restricted),
+         end_month = factor(end_month),
+         type_restricted = factor(type_restricted),
+         Propens_hw_LSOA_category = factor(Propens_hw_LSOA_category),
+         Propens_hw_LSOA_category_dummy = factor(Propens_hw_LSOA_category_dummy),
+         Mode_pt_perc_category = factor(Mode_pt_perc_category),
+         Mode_pt_perc_category_dummy = factor(Mode_pt_perc_category_dummy),
+         HW_PT_category_dummy = factor(HW_PT_category_dummy)
+         )
+
+# Set "Low" propensity to homeworking as the reference level in Propens_hw_LSOA_category variable
+england_listings_mm$Propens_hw_LSOA_category <- relevel(england_listings_mm$Propens_hw_LSOA_category, ref = "Low")
+
+# Set "Low" percentage of people travelling to work by PT as the reference level in Mode_pt_perc_category variable
+england_listings_mm$Mode_pt_perc_category <- relevel(england_listings_mm$Mode_pt_perc_category, ref = "Low")
+
+# Set "0" in Propens_hw_LSOA_category_dummy variable as the reference level (low propensity to homeworking)
+england_listings_mm$Propens_hw_LSOA_category_dummy <- relevel(england_listings_mm$Propens_hw_LSOA_category_dummy, ref = "0")
+
+# Set "0" in Mode_pt_perc_category_dummy variable as the reference level (low percentage of people travelling to work by PT)
+england_listings_mm$Mode_pt_perc_category_dummy <- relevel(england_listings_mm$Mode_pt_perc_category_dummy, ref = "0")
+
+# Set "0" in HW_PT_category_dummy variable as the reference level 
+england_listings_mm$HW_PT_category_dummy <- relevel(england_listings_mm$HW_PT_category_dummy, ref = "0")
+
+# Count the number of listings within each TTWA 
+ttwa_counts <- england_listings_mm %>%
+  count(TTWA11CD) %>%
+  st_drop_geometry()
+
+# Print the counts
+print(ttwa_counts)
+
+# Calculate the number of TTWAs with 6000 or more listings over all 4 years (pre & post)
+ttwa_counts_6000 <- sum(ttwa_counts$n >6000)
+
+# Print the number of TTWAs with 6000 or more listings over all 4 years (pre & post)
+print(ttwa_counts_6000)
+
+# Restrict dataset to TTWAs with 6000 or more listings over all 4 years (pre & post) (N = 74)
+england_listings_mm <- england_listings_mm %>%
+  group_by(TTWA11CD) %>%
+  filter(n() >= 6000 & ttwa_pop_2020 >= 200000) %>%
+  ungroup()
+
+# Create a housing affordability variable based on the median across only the TTWAs where we run the analysis (N=74)
+ttwa_affordability_analysis_only <- ttwa_affordability %>%
+  filter(TTWA11CD %in% unique(england_listings_mm$TTWA11CD)) %>%
+  mutate(ttwa_ha_2023_ratio_band_analysis_only = ifelse(ha_2023_ratio_ttwa > median(ha_2023_ratio_ttwa), "Low Housing Affordability", "High Housing Affordability")) %>%
+  select(-ttwa_ha_2023_ratio_band)
+
+# Add Housing affordability variable with high/low bands across TTWAs in analysis to Zoopla data
+england_listings_mm <- england_listings_mm %>%
+  left_join(ttwa_affordability_analysis_only %>%
+              select(-TTWA11NM,-ha_2023_ratio_ttwa), by = "TTWA11CD")
+
+```
+
+## Outliers Processing 
+Here we remove outliers from the listings data using the Intequartile Range (IQR) Rule (Outliers are below Q1 − 1.5 × IQRq1 or above Q3 + 1.5 × IQRq3) within each 2011 TTW Area. 
+
+```{r data outliers}
+
+# Find IQR and remove outliers within each TTWA and number of beds category. 
+# For the number of beds we use the restricted variable with 1,2,3,4+ beds. 
+england_listings_mm_filtered_outliers <- england_listings_mm %>%
+  group_by(TTWA11CD, bed_restricted) %>%
+  mutate(
+    Q1 = quantile(nprice_log, 0.25),
+    Q3 = quantile(nprice_log, 0.75),
+    IQR = Q3 - Q1
+  ) %>%
+  filter(nprice_log >= Q1 - 1.5 * IQR & nprice_log <= Q3 + 1.5 * IQR) %>%
+  ungroup() %>%
+  select(-Q1, -Q3, -IQR)
+
+# Check how many entries are removed (we lose 83,545 entries out of 2,726,897 entries in total. This is 3.06%.)
+## Total entries are 2,643,352; Pre-pandemic: 1,345,964; Post-pandemic: 1,297,388
+outliers_removed <- nrow(england_listings_mm) - nrow(england_listings_mm_filtered_outliers)
+
+# Print the number of entries removed as outliers
+print(outliers_removed)
+
+# Overwrite temp with the dataset without outliers
+england_listings_mm <- england_listings_mm_filtered_outliers
+
+# Clean up
+rm(outliers_removed, england_listings_mm_filtered_outliers)
+
+```
+
+## Figure S1: Plot correlations between PC1, PC2 and Population Density for each TTWA
+Here we use Pearson's R correlations to plot the correlations between PC1,PC2 and population density for each TTWA.
+
+```{r plot correl_PCs_pop_dens}
+
+# Create dataset with 2011 LSOAs and their corresponding 2011 TTWAs (only TTTWAs in analysis)
+## LSOAs in England only
+PC_PopDens_plot <- ttwa2011_lsoa2011 %>%
+  filter(TTWA11CD %in% unique(england_listings_mm$TTWA11CD) & LSOA11CD %in% unique(england_listings_mm$lsoa2011_code))
+
+# Bring in the data for PT accessibility PCs
+PC_PopDens_plot <- PC_PopDens_plot %>%
+  left_join(access_employment_all_pt %>% rename("LSOA11CD" = "geo_code") %>% select(LSOA11CD,PC1,PC2), by = "LSOA11CD")
+
+# Bring in the data for population density for each LSOA
+PC_PopDens_plot <- PC_PopDens_plot %>%
+  left_join(pop_dens_2020_lsoa %>% select(-pop_2020) %>% rename("LSOA11CD" = "lsoa2011_code"), by = "LSOA11CD") %>%
+  rename("pop_dens_lsoa" = "pop_dens")
+
+# Convert population and population density variables to numeric
+PC_PopDens_plot <- PC_PopDens_plot %>%
+  mutate(pop_dens_lsoa = as.numeric(gsub(",", "", pop_dens_lsoa)))
+
+# Nest the data by TTWA11CD
+PC_PopDens_plot_plot_nested <- PC_PopDens_plot %>%
+  group_by(TTWA11CD) %>%
+  nest() %>%
+  ungroup()
+
+# Create a function to calculate Pearson correlations
+calculate_correlations <- function(data) {
+  data %>%
+    summarise(
+      corr_PC1 = cor(PC1, pop_dens_lsoa, use = "complete.obs"),
+      corr_PC2 = cor(PC2, pop_dens_lsoa, use = "complete.obs")
+    )
+}
+
+# Run the correlations
+correlation_results <- PC_PopDens_plot_plot_nested %>%
+  mutate(correlations = map(data, calculate_correlations)) %>%
+  unnest(correlations)
+
+# Prepare correlation results for plotting
+plot_data <- correlation_results %>%
+  pivot_longer(cols = c(corr_PC1, corr_PC2), names_to = "PC", values_to = "Correlation") %>%
+  mutate(PC = ifelse(PC == "corr_PC1", "PC1", "PC2"))
+
+# Bring in the population of each TTWA to the df with the correlations for plotting and add log10 variable for TTWAs' populations
+plot_data <- plot_data %>%
+  left_join(ttwa_pop_agg %>% mutate(ttwa_pop_2020_log = log10(ttwa_pop_2020)), by = "TTWA11CD")
+
+# Create a custom theme for the plot
+custom_theme <- 
+  theme_classic(base_size = 25) +
+  theme(
+    axis.title.x = element_text(margin = margin(t = 10), size = 27),
+    axis.text.x = element_text(size = 19),
+    axis.title.y = element_text(margin = margin(r = 10), size = 27),
+    axis.text.y = element_text(size = 19),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+    )
+
+# Create plot for PC1 and PC2 correlations
+correlations_plot <- ggplot(data = plot_data, aes(x = ttwa_pop_2020_log, y = Correlation, color = PC)) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black") +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_smooth(aes(group = PC), method = "lm", se = FALSE, linetype = "dashed") +
+  labs(x = "TTWA Population (log.10)",
+       y = "Pearson Correlation Coefficient",
+       color = "PTAE Principal Component") +
+  scale_color_manual(values = c("PC1" = "#1f77b4", "PC2" = "#ff7f0e")) +
+  custom_theme
+
+# Save the plot
+ggsave(filename = here("Outputs", "FigS1_PCs_vs_PopDens_Correlations_plot.png"), correlations_plot, bg = "white", width = 16, height = 11, units = "in") 
+
+```
+
+## Figure S2: Plot % of working people travelling to work by PT against TTWA population
+Here we plot the percentage of working travelling to work by PT against the TTWA population. This is to establish whether larger TTWAs have a higher % of people using PT for employment. 
+
+``` {r plot pt_ttwa_pop}
+
+# Calculate a weighted mean of % Use of PT for employment for each TTWA using the LSOA population as weights
+##Keep TTWAs where we run the analysis
+percentage_by_ttwa_pt_mode_plot <- percentage_by_lsoa_pt_mode %>%
+  group_by(TTWA11CD) %>%
+  summarise(TTWA_Mode_pt_perc = sum(Mode_pt_perc * pop_2020, na.rm = TRUE) / sum(pop_2020, na.rm = TRUE),
+            ttwa_pop_2020 = sum(pop_2020, na.rm = TRUE)) %>%
+  filter(TTWA11CD %in% unique(england_listings_mm$TTWA11CD))
+
+# Bring in housing affordability data for each TTWA
+percentage_by_ttwa_pt_mode_plot <- percentage_by_ttwa_pt_mode_plot %>%
+  left_join(ttwa_affordability_analysis_only %>% 
+              select(-ha_2023_ratio_ttwa,-TTWA11NM), by = "TTWA11CD")
+
+# Make pt_mode percentage (*100) 
+percentage_by_ttwa_pt_mode_plot <- percentage_by_ttwa_pt_mode_plot %>%
+  mutate(TTWA_Mode_pt_perc = TTWA_Mode_pt_perc*100)
+
+# Create a log10 variable for TTWAs' populations
+percentage_by_ttwa_pt_mode_plot <- percentage_by_ttwa_pt_mode_plot %>%
+  mutate(ttwa_pop_2020_log = log10(ttwa_pop_2020))
+
+# Create a custom theme for plots
+custom_theme <- 
+  theme_classic(base_size = 25) +
+  theme(
+    axis.title.x = element_text(margin = margin(t = 10), size = 27),
+    axis.text.x = element_text(size = 19),
+    axis.title.y = element_text(margin = margin(r = 10), size = 27),
+    axis.text.y = element_text(size = 19),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+    )
+
+# Create Plot with colour based on housing affordability band
+PT_TTWApop_plot <- ggplot(data = percentage_by_ttwa_pt_mode_plot, aes(x = ttwa_pop_2020_log, y = TTWA_Mode_pt_perc, color = ttwa_ha_2023_ratio_band_analysis_only)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "black") +
+  labs(x = "TTWA Population (log.10)",
+       y = "Percentage Using Public Transport to Work (%)",
+       color = "Housing Affordability Band") +
+  scale_color_manual(values = c("High Housing Affordability" = "#1f77b4", "Low Housing Affordability" = "#ff7f0e")) +
+  custom_theme
+
+# Save the plot
+ggsave(filename = here("Outputs", "FigS2_PTuse_TTWApop_Sales_plot.png"), PT_TTWApop_plot, bg = "white", width = 16, height = 11, units = "in")
+
+```
+
+## Figure S3: Plot correlations between PC1, PC2 and % of people using PT to work within each TTWA
+Here we use Pearson's R correlations to plot the correlations between PC1,PC2 and % of people using PT to work within each TTWA. 
+
+```{r plot correl_PCs_PT_perc}
+
+# Create dataset with 2011 LSOAs and their corresponding 2011 TTWAs (only TTTWAs in analysis)
+## LSOAs in England only
+PC_PT_Percentage_plot <- ttwa2011_lsoa2011 %>%
+  filter(TTWA11CD %in% unique(england_listings_mm$TTWA11CD) & LSOA11CD %in% unique(england_listings_mm$lsoa2011_code))
+
+# Bring in the data for PT accessibility PCs
+PC_PT_Percentage_plot <- PC_PT_Percentage_plot %>%
+  left_join(access_employment_all_pt %>% rename("LSOA11CD" = "geo_code") %>% select(LSOA11CD,PC1,PC2), by = "LSOA11CD")
+
+# Bring in the data for housing affordability for each TTWA
+PC_PT_Percentage_plot <- PC_PT_Percentage_plot %>%
+  left_join(ttwa_affordability %>% select(TTWA11CD,ttwa_ha_2023_ratio_band), by = "TTWA11CD") 
+
+# Bring in the data for % of people travelling to work by PT
+PC_PT_Percentage_plot <- PC_PT_Percentage_plot %>% 
+  left_join(percentage_by_lsoa_pt_mode %>% select(LSOA11CD, Mode_pt_perc, pop_2020), by = "LSOA11CD")
+
+# Nest the data by TTWA11CD
+PC_PT_Percentage_plot_nested <- PC_PT_Percentage_plot %>%
+  group_by(TTWA11CD) %>%
+  nest() %>%
+  ungroup()
+
+# Create a function to calculate Pearson correlations
+calculate_correlations <- function(data) {
+  data %>%
+    summarise(
+      corr_PC1 = cor(PC1, Mode_pt_perc, use = "complete.obs"),
+      corr_PC2 = cor(PC2, Mode_pt_perc, use = "complete.obs")
+    )
+}
+
+# Run the correlations
+correlation_results <- PC_PT_Percentage_plot_nested %>%
+  mutate(correlations = map(data, calculate_correlations)) %>%
+  unnest(correlations)
+
+# Prepare correlation results for plotting
+plot_data <- correlation_results %>%
+  pivot_longer(cols = c(corr_PC1, corr_PC2), names_to = "PC", values_to = "Correlation") %>%
+  mutate(PC = ifelse(PC == "corr_PC1", "PC1", "PC2"))
+
+# Bring in the population of each TTWA to the df with the correlations for plotting and add log10 variable for TTWAs' populations
+plot_data <- plot_data %>%
+  left_join(ttwa_pop_agg %>% mutate(ttwa_pop_2020_log = log10(ttwa_pop_2020)), by = "TTWA11CD")
+
+# Create plot for PC1 and PC2 correlations
+correlations_plot <- ggplot(data = plot_data, aes(x = ttwa_pop_2020_log, y = Correlation, color = PC)) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black") +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_smooth(aes(group = PC), method = "lm", se = FALSE, linetype = "dashed") +
+  labs(x = "TTWA Population (log.10)",
+       y = "Pearson Correlation Coefficient",
+       color = "PTAE Principal Component") +
+  scale_color_manual(values = c("PC1" = "#1f77b4", "PC2" = "#ff7f0e")) +
+  custom_theme
+
+# Save the plot
+ggsave(filename = here("Outputs", "FigS3_PCs_vs_PTuse_Correlations_plot.png"), correlations_plot, bg = "white", width = 16, height = 11, units = "in")
+
+```
+
+## Run the "Many Models" analysis (Multiple Models/LME4)
+Here we run the models on the created dataset with a number of TTWAs (N = 74) in England.
+We use lmer from the lme4 package. We reduce the number of models to 4; a base model, an extension model with a dummy for high/low homeworking, an extension model with a dummy for high/low use of PT for employment, an extension model with a dummy for both homeworking and use of PT for employment.  
+
+* Subset1/Model1 - PC1, PC2, controls (type, size, month, population density), interaction terms (pandemic*PCs), random intercept at nhd level
+* Subset2/Model2 - PC1, PC2, controls (type, size, month, population density), interaction terms (pandemic*PCs), (PC1:HW), (PC1:pandemic_period:HW), random intercept at nhd level 
+* Subset3/Model3 - PC1, PC2, controls (type, size, month, population density), interaction terms (pandemic*PCs), (PC1:PT), (PC1:pandemic_period:PT), random intercept at nhd level 
+* Subset4/Model4 - PC1, PC2, controls (type, size, month, population density), interaction terms (pandemic*PCs), (PC1:HW_PT), (PC1:pandemic_period:HW_PT), random intercept at nhd level 
+
+**We use log10(pop_dens) to avoid scaling issues in the models
+
+```{r manymodels 3}
+
+# Create datasets
+subsets <- list(
+  subset1 = england_listings_mm,
+  subset2 = england_listings_mm,
+  subset3 = england_listings_mm,
+  subset4 = england_listings_mm
+)
+
+# Define model formulas
+model_formulas <- list(
+  model1 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            (PC1:pandemic_period) + (PC2:pandemic_period) + bed_restricted + end_month + 
+            log(pop_dens) + (1 | lsoa2011_code),
+  model2 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            (PC1:pandemic_period) + (PC2:pandemic_period) + bed_restricted + end_month + (PC1:Propens_hw_LSOA_category_dummy) + 
+            ((PC1:pandemic_period) * Propens_hw_LSOA_category_dummy) + log10(pop_dens) + (1 | lsoa2011_code),
+  model3 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            (PC1:pandemic_period) + (PC2:pandemic_period) + bed_restricted + end_month + (PC1:Mode_pt_perc_category_dummy) + 
+            ((PC1:pandemic_period) * Mode_pt_perc_category_dummy) + log10(pop_dens) + (1 | lsoa2011_code),
+  model4 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            (PC1:pandemic_period) + (PC2:pandemic_period) + bed_restricted + end_month + (PC1:HW_PT_category_dummy) + 
+            ((PC1:pandemic_period) * HW_PT_category_dummy) + log10(pop_dens) + (1 | lsoa2011_code)
+)
+
+# Pair each dataset with a model
+subset_model_pairs <- list(
+  subset1 = model_formulas$model1,
+  subset2 = model_formulas$model2,
+  subset3 = model_formulas$model3,
+  subset4 = model_formulas$model4
+)
+
+# Run the analysis
+model_results <- mapply(function(data, formula) {
+  data_nested <- data %>%
+    group_by(TTWA11CD) %>%
+    nest() %>%
+    ungroup()
+  data_nested %>%
+    mutate(
+      model_obj = map(data, ~lmer(formula, data = .x)),
+      tidy_res = map(model_obj, broom.mixed::tidy),
+      glance_res = map(model_obj, broom.mixed::glance)
+    ) %>%
+    select(TTWA11CD, model_obj, tidy_res) 
+}, subsets, subset_model_pairs, SIMPLIFY = FALSE)
+
+# Extract 'simple' coefficients 
+combined_results <- bind_rows(
+  lapply(names(model_results), function(subset_name) {
+    model_results[[subset_name]] %>%
+      unnest(tidy_res) %>%
+      mutate(subset = subset_name)
+  })
+)
+
+# Create function to extract 'total' coefficients/std. errors
+compute_linear_combo <- function(model, coefs) {
+  vcov_matrix <- as.matrix(vcov(model))
+  beta <- fixef(model)[coefs]
+  if (any(is.na(beta))) return(NULL)
+
+  estimate_sum <- sum(beta)
+  ones <- rep(1, length(coefs))
+  var_sum <- t(ones) %*% vcov_matrix[coefs, coefs] %*% ones
+  se_sum <- sqrt(var_sum)
+
+  list(estimate = estimate_sum, std.error = as.numeric(se_sum))
+}
+
+# Extract and calculate 'total' coefficients and their 95% CIs
+derived_effects <- bind_rows(
+  lapply(names(model_results), function(subset_name) {
+    model_subset <- model_results[[subset_name]]
+    
+    bind_rows(
+      lapply(1:nrow(model_subset), function(i) {
+        ttwa <- model_subset$TTWA11CD[i]
+        model <- model_subset$model_obj[[i]]
+        if (is.null(model)) return(NULL)
+
+        out <- list()
+
+        if (subset_name == "subset2") {
+          combo1 <- compute_linear_combo(model, c("PC1", "PC1:Propens_hw_LSOA_category_dummy1"))
+          combo2 <- compute_linear_combo(model, c("PC1:pandemic_period", "PC1:pandemic_period:Propens_hw_LSOA_category_dummy1"))
+          if (!is.null(combo1)) {
+            out <- append(out, list(data.frame(term = "PC1_hw_effect1", estimate = combo1$estimate, std.error = combo1$std.error)))
+          }
+          if (!is.null(combo2)) {
+            out <- append(out, list(data.frame(term = "PC1_pandemic_effect1", estimate = combo2$estimate, std.error = combo2$std.error)))
+          }
+          
+        } else if (subset_name == "subset3") {
+          combo1 <- compute_linear_combo(model, c("PC1", "PC1:Mode_pt_perc_category_dummy1"))
+          combo2 <- compute_linear_combo(model, c("PC1:pandemic_period", "PC1:pandemic_period:Mode_pt_perc_category_dummy1"))
+          if (!is.null(combo1)) {
+            out <- append(out, list(data.frame(term = "PC1_pt_effect1", estimate = combo1$estimate, std.error = combo1$std.error)))
+          }
+          if (!is.null(combo2)) {
+            out <- append(out, list(data.frame(term = "PC1_pandemic_effect1", estimate = combo2$estimate, std.error = combo2$std.error)))
+          }
+          
+        } else if (subset_name == "subset4") {
+          combo1 <- compute_linear_combo(model, c("PC1", "PC1:HW_PT_category_dummy1"))
+          combo2 <- compute_linear_combo(model, c("PC1:pandemic_period", "PC1:pandemic_period:HW_PT_category_dummy1"))
+          if (!is.null(combo1)) {
+            out <- append(out, list(data.frame(term = "PC1_hw_pt_effect1", estimate = combo1$estimate, std.error = combo1$std.error)))
+          }
+          if (!is.null(combo2)) {
+            out <- append(out, list(data.frame(term = "PC1_pandemic_effect1", estimate = combo2$estimate, std.error = combo2$std.error)))
+          }
+        } else {
+          return(NULL)
+        }
+        
+        bind_rows(out) %>%
+          mutate(subset = subset_name, TTWA11CD = ttwa)
+      })
+    )
+  })
+) %>%
+  mutate(
+    statistic = NA_real_,
+    df = NA_real_,
+    p.value = NA_real_,
+    sig05 = NA,
+    lci = estimate - 1.96 * std.error,
+    uci = estimate + 1.96 * std.error
+  )
+
+# Bind rows and calculate CIs for 'simple' terms
+combined_results <- bind_rows(
+  model_results$subset1 %>% mutate(subset = "subset1"),
+  model_results$subset2 %>% mutate(subset = "subset2"),
+  model_results$subset3 %>% mutate(subset = "subset3"),
+  model_results$subset4 %>% mutate(subset = "subset4")
+) %>%
+  unnest(tidy_res) %>%
+  mutate(
+    lci = estimate - 1.96 * std.error,
+    uci = estimate + 1.96 * std.error
+  )
+
+# Bind rows in 'total' effects
+derived_effects_combined <- bind_rows(derived_effects)
+
+# Add term labels
+derived_effects_labeled <- derived_effects_combined %>%
+  mutate(term = case_when(
+    subset == "subset2" & term == "PC1_hw_effect1" ~ "PC1_hw_effect1",
+    subset == "subset2" & term == "PC1_pandemic_effect1" ~ "PC1_hw_pandemic_effect1",
+    
+    subset == "subset3" & term == "PC1_pt_effect1" ~ "PC1_pt_effect1",
+    subset == "subset3" & term == "PC1_pandemic_effect1" ~ "PC1_pt_pandemic_effect1",
+    
+    subset == "subset4" & term == "PC1_hw_pt_effect1" ~ "PC1_hw_pt_effect1",
+    subset == "subset4" & term == "PC1_pandemic_effect1" ~ "PC1_hw_pt_pandemic_effect1",
+    
+    TRUE ~ term
+  )) %>%
+  select(subset, TTWA11CD, term, estimate, std.error, statistic, df, p.value, lci, uci) %>%
+  mutate(sig05 = NA)
+
+# Add all together
+combined_results <- bind_rows(combined_results, derived_effects_labeled)
+
+```
+
+## Model Diagnostics
+Here we run a number of diagnostics on the models and calculate the median population and surface area across all lsoas in the dataset
+
+```{r model diagnostics}
+
+# Get population 2020 for each lsoa
+lsoa_population <- england_listings_mm %>%
+  group_by(lsoa2011_code) %>%
+  summarise(pop_2020 = first(pop_2020)) %>%
+  ungroup()
+
+# Make population numeric
+lsoa_population <- lsoa_population %>%
+  mutate(
+    pop_2020 = gsub(",", "", pop_2020),     
+    pop_2020 = as.numeric(pop_2020)
+  )
+
+# Get lsoa polygons from lsoa sf 
+lsoa_summary <- lsoa_2011_bound_sf %>%
+  inner_join(st_drop_geometry(lsoa_population), by = c("geo_code" = "lsoa2011_code"))
+
+# Make sure we're using the correct format in the coordinate system (BNG)
+lsoa_summary <- st_transform(lsoa_summary, 27700)
+
+# Calculate lsoa area km2
+lsoa_summary <- lsoa_summary %>%
+  mutate(area_km2 = st_area(geometry) %>% units::set_units("km^2") %>% as.numeric())
+
+# Bring all together (pop/surface area)
+population_area_summary <- lsoa_summary %>%
+  summarise(
+    median_area_km2 = round(median(area_km2),2),
+    IQR_area_km2 = round(IQR(area_km2),2),
+    median_population = median(pop_2020),
+    IQR_population = round(IQR(pop_2020),0)
+  )
+
+# Show population/surface area summary
+print(population_area_summary)
+
+# Create datasets for diagnostics
+diag_subsets <- list(
+  subset1 = england_listings_mm,
+  subset2 = england_listings_mm,
+  subset3 = england_listings_mm,
+  subset4 = england_listings_mm
+)
+
+# Create formulas for diagnostics
+diag_formulas <- list(
+  model1 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            PC1:pandemic_period + PC2:pandemic_period + bed_restricted + end_month + 
+            log(pop_dens) + (1 | lsoa2011_code),
+  model2 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            PC1:pandemic_period + PC2:pandemic_period + bed_restricted + end_month + PC1:Propens_hw_LSOA_category_dummy +
+            (PC1:pandemic_period * Propens_hw_LSOA_category_dummy) + log10(pop_dens) + (1 | lsoa2011_code),
+  model3 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            PC1:pandemic_period + PC2:pandemic_period + bed_restricted + end_month + PC1:Mode_pt_perc_category_dummy +
+            (PC1:pandemic_period * Mode_pt_perc_category_dummy) + log10(pop_dens) + (1 | lsoa2011_code),
+  model4 = nprice_log ~ PC1 + PC2 + type_restricted + pandemic_period + 
+            PC1:pandemic_period + PC2:pandemic_period + bed_restricted + end_month + PC1:HW_PT_category_dummy +
+            (PC1:pandemic_period * HW_PT_category_dummy) + log10(pop_dens) + (1 | lsoa2011_code)
+)
+
+# Create a function to run the models
+run_model_diag <- function(data, formula) {
+  model <- lmer(formula, data = data)
+  list(model = model)
+}
+
+# Run models and save necessary objects for diagnostics
+diag_model_results <- mapply(function(data, formula) {
+  data %>%
+    group_by(TTWA11CD) %>%
+    nest() %>%
+    mutate(mod = map(data, ~run_model_diag(.x, formula))) %>%
+    ungroup()
+}, diag_subsets, diag_formulas, SIMPLIFY = FALSE)
+
+# Create a function to run diagnostics
+diag_diagnose_model <- function(model_obj) {
+  list(
+    convergence = performance::check_convergence(model_obj),
+    singularity = performance::check_singularity(model_obj),
+    vif = suppressWarnings(performance::check_collinearity(model_obj)),
+    r2_icc = performance::r2(model_obj),
+    dharma = {
+      sim_res <- DHARMa::simulateResiduals(model_obj, plot = FALSE)
+      list(
+        simulation = sim_res,
+        dispersion = DHARMa::testDispersion(sim_res),
+        zero_inflation = DHARMa::testZeroInflation(sim_res)
+      )
+    }
+  )
+}
+
+# Run diagnostics on all models and save
+## Create list to store diagnostics
+diagnostics_results <- list()
+
+## Run diagnostics
+for (subset_name in names(diag_model_results)) {
+  subset_df <- diag_model_results[[subset_name]]
+  diagnostics_results[[subset_name]] <- list()
+  
+  for (i in seq_len(nrow(subset_df))) {
+    ttwa_code <- subset_df$TTWA11CD[i]
+    model_obj <- subset_df$mod[[i]]$model
+    diagnostics_results[[subset_name]][[ttwa_code]] <- diag_diagnose_model(model_obj)
+  }
+}
+
+# Extract diagnostics in a table
+## Create list to store values
+all_rows <- list()
+
+## Extract values
+for (subset_name in names(diagnostics_results)) {
+  subset_list <- diagnostics_results[[subset_name]]
+
+  for (ttwa_code in names(subset_list)) {
+    diag_list <- subset_list[[ttwa_code]]
+
+    convergence <- if (is.logical(diag_list$convergence)) diag_list$convergence else NA
+    singular <- if (is.logical(diag_list$singularity)) diag_list$singularity else NA
+
+    dispersion_p <- diag_list$dharma$dispersion$p.value
+    zero_inflation_p <- diag_list$dharma$zero_inflation$p.value
+
+    conditional_R2 <- as.numeric(diag_list$r2_icc$R2_conditional)
+    marginal_R2 <- as.numeric(diag_list$r2_icc$R2_marginal)
+
+    row <- tibble(
+      subset = subset_name,
+      TTWA11CD = ttwa_code,
+      convergence = convergence,
+      singular = singular,
+      dispersion_p = dispersion_p,
+      zero_inflation_p = zero_inflation_p,
+      conditional_R2 = conditional_R2,
+      marginal_R2 = marginal_R2
+    )
+
+    all_rows <- append(all_rows, list(row))
+  }
+}
+
+## Bind rows
+diagnostics_summary <- bind_rows(all_rows)
+
+# Rename subsets to models
+diagnostics_summary <- diagnostics_summary %>%
+  rename(Model = subset) %>%
+  mutate(Model = recode(Model,
+                        "subset1" = "model1",
+                        "subset2" = "model2",
+                        "subset3" = "model3",
+                        "subset4" = "model4"))
+
+# Create a summary table per model
+summary_table <- diagnostics_summary %>%
+  group_by(Model) %>%
+  summarise(
+    `Converged (%)` = mean(convergence, na.rm = TRUE) * 100,
+    `Singular fit (%)` = mean(singular, na.rm = TRUE) * 100,
+    `TTWAs with significant dispersion (p < 0.05)` = sum(dispersion_p < 0.05, na.rm = TRUE),
+    `TTWAs with significant zero-inflation (p < 0.05)` = sum(zero_inflation_p < 0.05, na.rm = TRUE),
+    `Median Marginal R2` = round(median(marginal_R2, na.rm = TRUE), 2),
+    `IQR Marginal R2` = paste0(
+      round(quantile(marginal_R2, 0.25, na.rm = TRUE), 2), " – ",
+      round(quantile(marginal_R2, 0.75, na.rm = TRUE), 2)),
+    `Median Conditional R2` = round(median(conditional_R2, na.rm = TRUE), 2),
+    `IQR Conditional R2` = paste0(
+      round(quantile(conditional_R2, 0.25, na.rm = TRUE), 2), " – ",
+      round(quantile(conditional_R2, 0.75, na.rm = TRUE), 2))
+  )
+
+# Create kable table
+kable(summary_table, caption = "Model Diagnostics Summary by Model")
+
+# Save in excel file
+write_xlsx(summary_table, path = here("Outputs", "model_diagnostics_summary.xlsx"))
+
+```
+
+## Figure S4, Table S5: Plot the Many Models results (Multiple Model/LME4) (Facet for Base models 20 Largest vs Rest; 650k population threshold)
+Here we plot the base models in facet for large and small population TTWAs within the ones we run the analysis. 650k population threshold. This is 20 largest vs rest.
+
+``` {r manymodels base large/small facet 650k}
+
+# Create a list of all the TTWAs where we run the analysis and fix column names
+TTWA_analysis_list <- as.data.frame(unique(combined_results$TTWA11CD)) %>%
+    rename("TTWA11CD" = "unique(combined_results$TTWA11CD)")
+
+# Bring in the mid-2020 population for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+    left_join(ttwa_pop_agg %>% select(-ttwa_pop_2020_band), by = "TTWA11CD")
+
+# Create a variable with Large/Small bands for TTWA population (above/below 650k population)
+TTWA_analysis_list <- TTWA_analysis_list %>%
+    mutate(ttwa_pop_2020_band = case_when(
+        ttwa_pop_2020 >= 650000 ~ "Large",
+        ttwa_pop_2020 < 650000 ~ "Small"
+    ))
+
+# Create separate dataframes for large and small TTWAs
+large_pop_TTWAs <- TTWA_analysis_list %>%
+    filter(ttwa_pop_2020_band == "Large") %>%
+    select(TTWA11CD)
+
+small_pop_TTWAs <- TTWA_analysis_list %>%
+    filter(ttwa_pop_2020_band == "Small") %>%
+    select(TTWA11CD)
+
+large_pop_TTWAs_combined_results <- combined_results %>%
+    filter(TTWA11CD %in% large_pop_TTWAs$TTWA11CD)
+
+small_pop_TTWAs_combined_results <- combined_results %>%
+    filter(TTWA11CD %in% small_pop_TTWAs$TTWA11CD)
+
+# Extract terms for the base model for large and small TTWAs
+extract_terms <- function(df) {
+    PC1_terms <- df %>%
+        filter(term == "PC1" & subset == "subset1") %>%
+        rename(PC1_estimate = estimate, PC1_lci = lci, PC1_uci = uci)
+    
+    PC2_terms <- df %>%
+        filter(term == "PC2" & subset == "subset1") %>%
+        rename(PC2_estimate = estimate, PC2_lci = lci, PC2_uci = uci)
+    
+    interaction_PC1 <- df %>%
+        filter(term == "PC1:pandemic_period" & subset == "subset1") %>%
+        rename(PC1_pandemic_estimate = estimate, PC1_pandemic_lci = lci, PC1_pandemic_uci = uci)
+    
+    interaction_PC2 <- df %>%
+        filter(term == "PC2:pandemic_period" & subset == "subset1") %>%
+        rename(PC2_pandemic_estimate = estimate, PC2_pandemic_lci = lci, PC2_pandemic_uci = uci)
+    
+    merged_PC1 <- left_join(interaction_PC1, PC1_terms, by = "TTWA11CD")
+    merged_PC2 <- left_join(interaction_PC2, PC2_terms, by = "TTWA11CD")
+    
+    bind_rows(
+        merged_PC1 %>% mutate(variable = "PC1"),
+        merged_PC2 %>% mutate(variable = "PC2")
+    )
+}
+
+# Extract coefficients
+large_TTWAs_data <- extract_terms(large_pop_TTWAs_combined_results)
+small_TTWAs_data <- extract_terms(small_pop_TTWAs_combined_results)
+
+# Combine data for plotting
+interaction_combined <- bind_rows(
+    large_TTWAs_data %>% mutate(pop_band = "Large"),
+    small_TTWAs_data %>% mutate(pop_band = "Small")
+)
+
+# Create flag for significance
+interaction_combined <- interaction_combined %>%
+  mutate(
+    sig = if_else(
+      (variable == "PC1" & PC1_pandemic_lci > 0 & PC1_pandemic_uci > 0) |
+      (variable == "PC1" & PC1_pandemic_lci < 0 & PC1_pandemic_uci < 0) |
+      (variable == "PC2" & PC2_pandemic_lci > 0 & PC2_pandemic_uci > 0) |
+      (variable == "PC2" & PC2_pandemic_lci < 0 & PC2_pandemic_uci < 0),
+      "Significant", "Not significant"
+    )
+  )
+
+# Plot theme
+custom_theme <- theme_classic(base_size = 60) +
+    theme(
+        axis.title.x = element_text(margin = margin(t = 20), size = 51),
+        axis.text.x = element_text(size = 38),
+        axis.title.y = element_text(margin = margin(r = 20), size = 51),
+        axis.text.y = element_text(size = 38),
+        legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 50),
+        legend.text = element_text(size = 38),
+        legend.margin = margin(t = -20)
+    )
+
+# Create the plot (PC1, PC2)
+ggplot(interaction_combined, aes(
+    x = if_else(variable == "PC1", PC1_estimate, PC2_estimate),
+    y = if_else(variable == "PC1", PC1_pandemic_estimate, PC2_pandemic_estimate)
+)) +
+    geom_hline(yintercept = 0, colour = "gray50", size = 1.5) +
+    geom_vline(xintercept = 0, colour = "gray50", size = 1.5) +
+
+    geom_point(aes(color = pop_band, alpha = sig), size = 6) +
+    scale_alpha_manual(values = c("Significant" = 0.9, "Not significant" = 0.2), guide = "none") +
+
+    geom_smooth(
+        method = "loess",
+        se = FALSE,
+        aes(color = pop_band),
+        linetype = "dashed",
+        size = 2.0,
+        span = 0.9,
+        show.legend = TRUE
+    ) +
+
+    geom_smooth(
+        data = interaction_combined %>% mutate(pop_band = "Overall"),
+        aes(
+            x = if_else(variable == "PC1", PC1_estimate, PC2_estimate),
+            y = if_else(variable == "PC1", PC1_pandemic_estimate, PC2_pandemic_estimate),
+            linetype = "Trend Line"
+        ),
+        method = "loess",
+        se = FALSE,
+        size = 1.5,
+        color = "black",
+        fill = NA,
+        show.legend = TRUE
+    ) +
+
+    scale_color_manual(
+        name = "TTWA Population Band",
+        values = c("Large" = "#1f77b4", "Small" = "#ff7f0e"),
+        labels = c("Large" = "20 Largest TTWAs", "Small" = "Rest TTWAs")
+    ) +
+    scale_linetype_manual(
+        name = NULL,
+        values = c("Trend Line" = "dashed"),
+        labels = c("Trend Line" = "Overall")
+    ) +
+
+    labs(
+        x = "Main Effect Coefficient (PC1, PC2)",
+        y = "Interaction Term Coefficient (PC1:pandemic, PC2:pandemic)"
+    ) +
+
+    custom_theme +
+    facet_grid(variable ~ ., labeller = labeller(variable = c(PC1 = "PC1", PC2 = "PC2")), scales = "free") +
+    theme(
+        strip.text = element_text(size = 45, hjust = 0.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 1.5)
+    ) +
+    scale_y_continuous(breaks = seq(-0.5, 0.2, by = 0.05), labels = scales::label_number(accuracy = 0.05)) +
+    scale_x_continuous(breaks = seq(-2, 2, by = 0.5)) +
+    coord_cartesian(xlim = c(-0.8, 1.5), ylim = c(-0.1, 0.1)) +
+    geom_hline(yintercept = seq(-0.5, 0.2, by = 0.05), color = "gray90", size = 1.5, linetype = "dashed")
+
+# Save the plot
+ggsave(filename = here("Outputs", "FigS4_facet_plot_large_small_TTWAs_base_650k_v2.png"), width = 26, height = 22)
+
+# Bring in the PT use data for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+    left_join(percentage_by_ttwa_pt_mode, by = "TTWA11CD")
+
+# Bring in the Propensity to HW data for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+  left_join(propensity_with_median_ttwa %>% distinct(TTWA11CD,ttwa_median_Propens_hw), by = "TTWA11CD")
+
+# Create a variable of PT*HW for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+  mutate(PT_HW = TTWA_Mode_pt_perc*ttwa_median_Propens_hw)
+
+# Create a variable with High/Low bands for PT_HW
+TTWA_analysis_list <- TTWA_analysis_list %>%
+  mutate(PT_HW_band = case_when(
+    PT_HW >= median(PT_HW) ~ "High PT/HW",
+    PT_HW < median(PT_HW) ~ "Low PT/HW"
+  ))
+
+# Create a table with the results (S5)
+results_table <- interaction_combined %>%
+    mutate(
+        estimate = if_else(variable == "PC1", PC1_estimate, PC2_estimate),
+        pandemic_estimate = if_else(variable == "PC1", PC1_pandemic_estimate, PC2_pandemic_estimate),
+        pandemic_lci = if_else(variable == "PC1", PC1_pandemic_lci, PC2_pandemic_lci),
+        pandemic_uci = if_else(variable == "PC1", PC1_pandemic_uci, PC2_pandemic_uci),
+        lci = if_else(variable == "PC1", PC1_lci, PC2_lci),  
+        uci = if_else(variable == "PC1", PC1_uci, PC2_uci)   
+    ) %>%
+    select(TTWA11CD, variable, pop_band, 
+           estimate, pandemic_estimate, 
+           pandemic_lci, pandemic_uci,
+           lci, uci) %>%
+    rename(
+        `TTWA11CD` = TTWA11CD,
+        `Variable` = variable,
+        `Population Band` = pop_band,
+        `PC1/PC2 Estimate` = estimate,
+        `Pandemic Interaction Estimate` = pandemic_estimate,
+        `Pandemic Interaction Lower CI` = pandemic_lci,
+        `Pandemic Interaction Upper CI` = pandemic_uci,
+        `PC1/PC2 Lower CI` = lci,
+        `PC1/PC2 Upper CI` = uci
+    ) %>%
+    arrange(`Population Band`, TTWA11CD)
+
+# Group TTWA11CD in the ttwa2011_lsoa2011 file
+ttwa_names_grouped <- ttwa2011_lsoa2011 %>%
+    group_by(TTWA11CD) %>%
+    summarise(TTWA11NM = first(TTWA11NM), .groups = 'drop')  
+
+# Bring in names for each TTWA11CD in the results table
+results_table <- results_table %>%
+    left_join(ttwa_names_grouped, by = "TTWA11CD")
+
+# Bring in the Housing Affordability band for each TTWA
+results_table <- results_table %>%
+  left_join(
+    ttwa_affordability_analysis_only %>% 
+      select(TTWA11CD, ttwa_ha_2023_ratio_band_analysis_only) %>%
+      rename(`Housing Affordability Band` = ttwa_ha_2023_ratio_band_analysis_only),
+    by = "TTWA11CD"
+  )
+
+# Bring in the PT*HW band for each TTWA
+results_table <- results_table %>%
+  left_join(
+    TTWA_analysis_list %>% 
+      select(TTWA11CD, PT_HW_band) %>%
+      rename(`PT*HW Band` = PT_HW_band),
+    by = "TTWA11CD"
+  )
+
+# Reorder columns
+results_table <- results_table %>%
+  select(TTWA11CD, TTWA11NM, `Variable`, `Population Band`, 
+         `Housing Affordability Band`, `PT*HW Band`,
+         `PC1/PC2 Estimate`, `PC1/PC2 Lower CI`, `PC1/PC2 Upper CI`, everything())
+
+# Format estimate columns to include CIs and remove separate CI columns
+results_table <- results_table %>%
+  mutate(
+    `PC1/PC2 Estimate` = sprintf("%.4f", round(`PC1/PC2 Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `PC1/PC2 Estimate` = paste0(`PC1/PC2 Estimate`, " (", 
+                            sprintf("%.4f", round(`PC1/PC2 Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                            sprintf("%.4f", round(`PC1/PC2 Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    
+    `Pandemic Interaction Estimate` = sprintf("%.4f", round(`Pandemic Interaction Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `Pandemic Interaction Estimate` = paste0(`Pandemic Interaction Estimate`, " (", 
+                                             sprintf("%.4f", round(`Pandemic Interaction Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Pandemic Interaction Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")")
+  ) %>%
+  select(-`PC1/PC2 Lower CI`, -`PC1/PC2 Upper CI`, -`Pandemic Interaction Lower CI`, -`Pandemic Interaction Upper CI`)
+
+# Save table (S5)
+write_xlsx(results_table, path = here("Outputs", "TableS5_TTWAs_results.xlsx"))
+
+```
+
+## Figure S5: Plot the Many Models results (Multiple Model/LME4) (Facet for Base models High/Low Housing Affordability & High/Low PT_HW for PC1 only)
+Here we plot the base models in facet for High/Low Housing Affordability & High/Low PT_HW for PC1 only. 
+
+```{r manymodels base high/low afford & high/low hw_pt facet}
+
+# Create a list of all the TTWAs where we run the analysis and fix column names
+TTWA_analysis_list <- as.data.frame(unique(combined_results$TTWA11CD)) %>%
+    rename("TTWA11CD" = "unique(combined_results$TTWA11CD)")
+
+# Bring in the PT use data for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+    left_join(percentage_by_ttwa_pt_mode, by = "TTWA11CD")
+
+# Bring in the Propensity to HW data for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+  left_join(propensity_with_median_ttwa %>% distinct(TTWA11CD,ttwa_median_Propens_hw), by = "TTWA11CD")
+
+# Create a variable of PT*HW for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+  mutate(PT_HW = TTWA_Mode_pt_perc*ttwa_median_Propens_hw)
+
+# Create a variable with High/Low bands for PT_HW
+TTWA_analysis_list <- TTWA_analysis_list %>%
+  mutate(PT_HW_band = case_when(
+    PT_HW >= median(PT_HW) ~ "High PT/HW",
+    PT_HW < median(PT_HW) ~ "Low PT/HW"
+  ))
+
+# Create separate dataframes for high and low PT*HW TTWAs
+high_pt_hw_TTWAs <- TTWA_analysis_list %>%
+    filter(PT_HW_band == "High PT/HW") %>%
+    select(TTWA11CD)
+
+low_pt_hw_TTWAs <- TTWA_analysis_list %>%
+    filter(PT_HW_band == "Low PT/HW") %>%
+    select(TTWA11CD)
+
+high_pt_hw_TTWAs_combined_results <- combined_results %>%
+    filter(TTWA11CD %in% high_pt_hw_TTWAs$TTWA11CD)
+
+low_pt_hw_TTWAs_combined_results <- combined_results %>%
+    filter(TTWA11CD %in% low_pt_hw_TTWAs$TTWA11CD)
+
+# Create a function to extract coefficients for PC1 only
+extract_terms_PC1 <- function(df) {
+    PC1_terms <- df %>%
+        filter(term == "PC1" & subset == "subset1") %>%
+        rename(PC1_estimate = estimate, PC1_lci = lci, PC1_uci = uci)
+    
+    interaction_PC1 <- df %>%
+        filter(term == "PC1:pandemic_period" & subset == "subset1") %>%
+        rename(PC1_pandemic_estimate = estimate, PC1_pandemic_lci = lci, PC1_pandemic_uci = uci)
+    
+    merged_PC1 <- left_join(interaction_PC1, PC1_terms, by = "TTWA11CD")
+    
+    merged_PC1 %>% mutate(variable = "PC1")
+}
+
+# Extract coefficients
+high_pt_hw_TTWAs_data_PC1 <- extract_terms_PC1(high_pt_hw_TTWAs_combined_results)
+low_pt_hw_TTWAs_data_PC1 <- extract_terms_PC1(low_pt_hw_TTWAs_combined_results)
+
+# Combine data for plotting PT_HW
+interaction_combined_PC1_pt_hw <- bind_rows(
+    high_pt_hw_TTWAs_data_PC1 %>% mutate(PT_HW_band = "High PT/HW"),
+    low_pt_hw_TTWAs_data_PC1 %>% mutate(PT_HW_band = "Low PT/HW")
+)
+
+# Create a list of the High Housing Affordability TTWAs (above median housing affordability ratio for TTWAs in analysis)
+high_ha_TTWAs <- ttwa_affordability_analysis_only %>%
+  filter(ttwa_ha_2023_ratio_band_analysis_only == "High Housing Affordability") %>%
+  select(TTWA11CD)
+
+# Create a list of the Low Housing Affordability TTWAs (below median housing affordability ratio for TTWAs in analysis)
+low_ha_TTWAs <- ttwa_affordability_analysis_only %>%
+  filter(ttwa_ha_2023_ratio_band_analysis_only == "Low Housing Affordability") %>%
+  select(TTWA11CD)
+
+# Create a df with results for high housing affordability TTWAs only
+high_ha_TTWAs_combined_results <- combined_results %>%
+  filter(TTWA11CD %in% high_ha_TTWAs$TTWA11CD)
+
+# Create a df with results for low housing affordability TTWAs only
+low_ha_TTWAs_combined_results <- combined_results %>%
+  filter(TTWA11CD %in% low_ha_TTWAs$TTWA11CD)
+
+# Extract coefficients
+high_ha_TTWAs_data_PC1 <- extract_terms_PC1(high_ha_TTWAs_combined_results)
+low_ha_TTWAs_data_PC1 <- extract_terms_PC1(low_ha_TTWAs_combined_results)
+
+# Combine data for plotting Housing Affordability
+interaction_combined_ha <- bind_rows(
+    high_ha_TTWAs_data_PC1 %>% mutate(ha_band = "High Housing Affordability"),
+    low_ha_TTWAs_data_PC1 %>% mutate(ha_band = "Low Housing Affordability")
+)
+
+# Combine the data for plotting PT_HW and Housing Affordability
+interaction_combined_PC1_pt_hw <- interaction_combined_PC1_pt_hw %>%
+    mutate(facet_group = "PT_HW")
+
+interaction_combined_ha <- interaction_combined_ha %>%
+    mutate(facet_group = "HA")
+
+combined_data <- bind_rows(interaction_combined_PC1_pt_hw, interaction_combined_ha)
+
+# Create a column with both bands for housing affordability and pt_hw
+combined_data <- combined_data %>%
+    mutate(
+        Band = if_else(facet_group == "PT_HW", PT_HW_band, ha_band)
+    )
+
+# Reorder factor levels of the 'Band' variable
+combined_data <- combined_data %>%
+    mutate(Band = factor(Band, levels = c(
+        "High Housing Affordability", 
+        "Low Housing Affordability", 
+        "High PT/HW", 
+        "Low PT/HW"
+    )))
+
+# Create flag for significance
+combined_data <- combined_data %>%
+  mutate(sig = if_else(
+    PC1_pandemic_lci > 0 & PC1_pandemic_uci > 0 |
+    PC1_pandemic_lci < 0 & PC1_pandemic_uci < 0,
+    "Significant", "Not significant"
+  ))
+
+# Plot theme
+custom_theme <- theme_classic(base_size = 50) +
+    theme(
+        axis.title.x = element_text(margin = margin(t = 20), size = 51),
+        axis.text.x = element_text(size = 38),
+        axis.title.y = element_text(margin = margin(r = 20), size = 51),
+        axis.text.y = element_text(size = 38),
+        legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 50),
+        legend.text = element_text(size = 38),
+        legend.margin = margin(t = -20)
+    )
+
+# Create the plot 
+combined_plot <- ggplot(combined_data, aes(
+    x = PC1_estimate,
+    y = PC1_pandemic_estimate,
+    color = Band
+)) +
+    geom_hline(yintercept = 0, colour = "gray50", size = 1.5) +
+    geom_vline(xintercept = 0, colour = "gray50", size = 1.5) +
+    geom_point(aes(alpha = sig), size = 6) +  
+    geom_smooth(aes(fill = Band), method = "loess", se = FALSE, linetype = "dashed", size = 2.0, span = 0.92, show.legend = FALSE) +
+    labs(
+        x = "Main Effect Coefficient (PC1)",
+        y = "Interaction Term Coefficient (PC1:pandemic)",
+        color = "Bands"
+    ) +
+    scale_color_manual(values = c(
+        "High PT/HW" = "#1f77b4", 
+        "Low PT/HW" = "#ff7f0e", 
+        "High Housing Affordability" = "#1f77b4", 
+        "Low Housing Affordability" = "#ff7f0e"
+    )) +
+    scale_fill_manual(values = c(
+        "High PT/HW" = "#1f77b4", 
+        "Low PT/HW" = "#ff7f0e", 
+        "High Housing Affordability" = "#1f77b4", 
+        "Low Housing Affordability" = "#ff7f0e"
+    )) +
+    scale_alpha_manual(values = c("Significant" = 0.9, "Not significant" = 0.2), guide = "none") +
+    custom_theme +
+    facet_grid(rows = vars(facet_group), scales = "free", labeller = labeller(facet_group = c("PT_HW" = "PT & HW", "HA" = "Housing Affordability"))) +
+    theme(
+        strip.text = element_text(size = 45, hjust = 0.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 1.5)
+    ) +
+    scale_y_continuous(breaks = seq(-0.5, 0.2, by = 0.05), labels = scales::label_number(accuracy = 0.05)) +
+    scale_x_continuous(breaks = seq(-2, 2, by = 0.5)) +
+    coord_cartesian(xlim = c(-0.8, 1.6), ylim = c(-0.1, 0.1)) +
+    geom_hline(yintercept = seq(-0.5, 0.2, by = 0.05), color = "gray90", size = 1.5, linetype = "dashed")
+
+# Save the combined plot
+ggsave(filename = here("Outputs", "FigS5_combined_plot_high_low_PT_HW_HA_TTWAs_PC1.png"), combined_plot, width = 27, height = 22)
+
+```
+
+## Figure S6, Table S6: Plot the Many Models results (Multiple Model/LME4) (All TTWAs; Extension Models only)
+Here we plot all results for extension models only for all TTWAs together. 
+
+```{r manymodels plot all TTWAs extensions only}
+
+# Create a dataset with results for all TTWAs 
+combined_results_all <- combined_results
+
+# Set Plot titles for the subsets
+subset_labels <- c(
+  subset2 = "Model HW",
+  subset3 = "Model PT",
+  subset4 = "Model HW_PT"
+)
+
+# Separate datasets for plotting (Large & Small combined)
+PC1_terms <- combined_results_all %>%
+  filter(term == "PC1") %>%
+  rename(PC1_estimate = estimate, PC1_lci = lci, PC1_uci = uci)
+
+interaction_PC1 <- combined_results_all %>%
+  filter(term == "PC1:pandemic_period") %>%
+  rename(PC1_pandemic_estimate = estimate, PC1_pandemic_lci = lci, PC1_pandemic_uci = uci)
+
+interaction_PC1_hw_total <- combined_results_all %>%
+  filter(term == "PC1_hw_effect1" & subset == "subset2") %>%
+  rename(PC1_HW_total_estimate = estimate, PC1_HW_total_lci = lci, PC1_HW_total_uci = uci)
+
+interaction_PC1_pt_total <- combined_results_all %>%
+  filter(term == "PC1_pt_effect1" & subset == "subset3") %>%
+  rename(PC1_PT_total_estimate = estimate, PC1_PT_total_lci = lci, PC1_PT_total_uci = uci)
+
+interaction_PC1_hw_pt_total <- combined_results_all %>%
+  filter(term == "PC1_hw_pt_effect1" & subset == "subset4") %>%
+  rename(PC1_HW_PT_total_estimate = estimate, PC1_HW_PT_total_lci = lci, PC1_HW_PT_total_uci = uci)
+
+interaction_PC1_pandemic_hw_total <- combined_results_all %>%
+  filter(term == "PC1_hw_pandemic_effect1" & subset == "subset2") %>%
+  rename(PC1_pandemic_hw_total_estimate = estimate,
+         PC1_pandemic_hw_total_lci = lci,
+         PC1_pandemic_hw_total_uci = uci)
+
+interaction_PC1_pandemic_pt_total <- combined_results_all %>%
+  filter(term == "PC1_pt_pandemic_effect1" & subset == "subset3") %>%
+  rename(PC1_pandemic_pt_total_estimate = estimate,
+         PC1_pandemic_pt_total_lci = lci,
+         PC1_pandemic_pt_total_uci = uci)
+
+interaction_PC1_pandemic_hw_pt_total <- combined_results_all %>%
+  filter(term == "PC1_hw_pt_pandemic_effect1" & subset == "subset4") %>%
+  rename(PC1_pandemic_hw_pt_total_estimate = estimate,
+         PC1_pandemic_hw_pt_total_lci = lci,
+         PC1_pandemic_hw_pt_total_uci = uci)
+
+# Merge interaction terms with corresponding PC1 terms
+merged_PC1 <- left_join(interaction_PC1, PC1_terms, by = c("TTWA11CD", "subset"))
+merged_PC1_hw_total <- left_join(interaction_PC1_pandemic_hw_total, interaction_PC1_hw_total, by = c("TTWA11CD", "subset"))
+merged_PC1_pt_total <- left_join(interaction_PC1_pandemic_pt_total, interaction_PC1_pt_total, by = c("TTWA11CD", "subset"))
+merged_PC1_hw_pt_total <- left_join(interaction_PC1_pandemic_hw_pt_total, interaction_PC1_hw_pt_total, by = c("TTWA11CD", "subset"))
+
+# Combine all datasets for plotting
+interaction_combined <- bind_rows(
+  merged_PC1 %>% mutate(variable = "PC1"),
+  merged_PC1_hw_total %>% mutate(variable = "PC1_pandemic_hw_total"),
+  merged_PC1_pt_total %>% mutate(variable = "PC1_pandemic_pt_total"),
+  merged_PC1_hw_pt_total %>% mutate(variable = "PC1_pandemic_hw_pt_total")
+)
+
+# Remove data for subset1 (base model)
+interaction_combined <- interaction_combined %>%
+  filter(!subset == "subset1")
+
+# Create flag for significance
+interaction_combined <- interaction_combined %>%
+  mutate(
+    y_sig = case_when(
+      variable == "PC1" ~ if_else(
+        PC1_pandemic_lci > 0 & PC1_pandemic_uci > 0 |
+        PC1_pandemic_lci < 0 & PC1_pandemic_uci < 0,
+        "Significant", "Not significant"
+      ),
+      variable == "PC1_pandemic_hw_total" ~ if_else(
+        PC1_pandemic_hw_total_lci > 0 & PC1_pandemic_hw_total_uci > 0 |
+        PC1_pandemic_hw_total_lci < 0 & PC1_pandemic_hw_total_uci < 0,
+        "Significant", "Not significant"
+      ),
+      variable == "PC1_pandemic_pt_total" ~ if_else(
+        PC1_pandemic_pt_total_lci > 0 & PC1_pandemic_pt_total_uci > 0 |
+        PC1_pandemic_pt_total_lci < 0 & PC1_pandemic_pt_total_uci < 0,
+        "Significant", "Not significant"
+      ),
+      variable == "PC1_pandemic_hw_pt_total" ~ if_else(
+        PC1_pandemic_hw_pt_total_lci > 0 & PC1_pandemic_hw_pt_total_uci > 0 |
+        PC1_pandemic_hw_pt_total_lci < 0 & PC1_pandemic_hw_pt_total_uci < 0,
+        "Significant", "Not significant"
+      )
+    )
+  )
+
+# Plot theme
+custom_theme <- theme_classic(base_size = 75) +
+    theme(
+        axis.title.x = element_text(margin = margin(t = 20), size = 95),
+        axis.text.x = element_text(size = 75),
+        axis.title.y = element_text(margin = margin(r = 20), size = 95),
+        axis.text.y = element_text(size = 75),
+        legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 95),
+        legend.text = element_text(size = 95),
+        legend.margin = margin(t = -20),
+        legend.key.size = unit(1, "cm"),
+        strip.text = element_text(size = 85, hjust = 0.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 1.5)
+    )
+
+# Plot
+plot <- interaction_combined %>%
+  ggplot(aes(
+    x = if_else(variable == "PC1", PC1_estimate,
+                if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_estimate,
+                        if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_estimate,
+                                PC1_HW_PT_total_estimate))),
+    y = if_else(variable == "PC1", PC1_pandemic_estimate,
+                if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_estimate,
+                        if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_estimate,
+                                PC1_pandemic_hw_pt_total_estimate))),
+    color = if_else(variable == "PC1", "Low", "High")
+  )) +
+  geom_hline(yintercept = 0, colour = "gray50", size = 1.5) +
+  geom_vline(xintercept = 0, colour = "gray50", size = 1.5) +
+  geom_point(aes(alpha = y_sig), size = 13, show.legend = FALSE) +  
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed", size = 5.0, span = 0.92) +
+  labs(
+    x = "Main Effect Coefficient",
+    y = "Interaction Term Coefficient",
+    color = "HW/PT/HW_PT Level"
+  ) +
+  scale_color_manual(values = c(
+    "Low" = "#1f77b4",  
+    "High" = "#ff7f0e"  
+  )) +
+  scale_alpha_manual(values = c(
+    "Significant" = 0.8,
+    "Not significant" = 0.2
+  )) +
+  guides(
+    color = guide_legend(override.aes = list(size = 5))
+  ) + 
+  custom_theme +
+  facet_grid(rows = vars(subset), scales = "free", labeller = labeller(subset = subset_labels)) +
+  scale_y_continuous(breaks = seq(-0.5, 0.2, by = 0.05), labels = scales::label_number(accuracy = 0.05)) +
+  scale_x_continuous(breaks = seq(-2, 2, by = 0.5)) +
+  coord_cartesian(xlim = c(-2, 2), ylim = c(-0.15, 0.1)) +
+  geom_hline(yintercept = seq(-0.5, 0.2, by = 0.05), color = "grey90", size = 2.5, linetype = "dashed")
+
+# Save plot
+ggsave(filename = here("Outputs", "FigS6_England_ManyModels_PCvsPandemicInt_Sales_All_TTWAs_Panel.png"), plot, width = 70, height = 60, limitsize = FALSE)
+
+# Create a table with the results (S6)
+summary_table_clean <- interaction_combined %>%
+  select(TTWA11CD, subset, variable, 
+         PC1_estimate, PC1_lci, PC1_uci, 
+         PC1_pandemic_estimate, PC1_pandemic_lci, PC1_pandemic_uci,
+         PC1_HW_total_estimate, PC1_HW_total_lci, PC1_HW_total_uci, PC1_PT_total_estimate, PC1_PT_total_lci, PC1_PT_total_uci, PC1_HW_PT_total_estimate, PC1_HW_PT_total_lci, PC1_HW_PT_total_uci, PC1_pandemic_hw_total_estimate, PC1_pandemic_hw_total_lci, PC1_pandemic_hw_total_uci, PC1_pandemic_pt_total_estimate, PC1_pandemic_pt_total_lci, PC1_pandemic_pt_total_uci, PC1_pandemic_hw_pt_total_estimate, PC1_pandemic_hw_pt_total_lci, PC1_pandemic_hw_pt_total_uci) %>%
+  mutate(subset = recode(subset,
+                         "subset2" = "HW",
+                         "subset3" = "PT",
+                         "subset4" = "HW_PT")) %>%
+  rename(
+    `PC1 Estimate` = PC1_estimate,
+    Variable = variable,
+    `PC1 Lower CI` = PC1_lci,
+    `PC1 Upper CI` = PC1_uci,
+    `Pandemic Interaction Estimate` = PC1_pandemic_estimate,
+    `Pandemic Interaction Lower CI` = PC1_pandemic_lci,
+    `Pandemic Interaction Upper CI` = PC1_pandemic_uci,
+    `Homeworking Interaction Total Estimate` = PC1_HW_total_estimate,
+    `Homeworking Interaction Total Lower CI` = PC1_HW_total_lci,
+    `Homeworking Interaction Total Upper CI` = PC1_HW_total_uci,
+    `PT Interaction Total Estimate` = PC1_PT_total_estimate,
+    `PT Interaction Total Lower CI` = PC1_PT_total_lci,
+    `PT Interaction Total Upper CI` = PC1_PT_total_uci,
+    `Homeworking and PT Interaction Total Estimate` = PC1_HW_PT_total_estimate,
+    `Homeworking and PT Interaction Total Lower CI` = PC1_HW_PT_total_lci,
+    `Homeworking and PT Interaction Total Upper CI` = PC1_HW_PT_total_uci,
+    `Pandemic and Homeworking Interaction Total Estimate` = PC1_pandemic_hw_total_estimate,
+    `Pandemic and Homeworking Interaction Total Lower CI` = PC1_pandemic_hw_total_lci,
+    `Pandemic and Homeworking Interaction Total Upper CI` = PC1_pandemic_hw_total_uci,
+    `Pandemic and PT Interaction Total Estimate` = PC1_pandemic_pt_total_estimate,
+    `Pandemic and PT Interaction Total Lower CI` = PC1_pandemic_pt_total_lci,
+    `Pandemic and PT Interaction Total Upper CI` = PC1_pandemic_pt_total_uci,
+    `Pandemic, PT and Homeworking Interaction Total Estimate` = PC1_pandemic_hw_pt_total_estimate,
+    `Pandemic, PT and Homeworking Interaction Total Lower CI` = PC1_pandemic_hw_pt_total_lci,
+    `Pandemic, PT and Homeworking Interaction Total Upper CI` = PC1_pandemic_hw_pt_total_uci
+  ) %>%
+  rename(Model = subset)
+
+# Bring in the Housing Affordability band, population, and name for each TTWA and create population band among the 74 TTWAs in analysis
+summary_table_clean <- summary_table_clean %>%
+  left_join(
+    ttwa_affordability_analysis_only %>% 
+      select(TTWA11CD, ttwa_ha_2023_ratio_band_analysis_only) %>%
+      rename(`Housing Affordability Band` = ttwa_ha_2023_ratio_band_analysis_only),
+    by = "TTWA11CD"
+  ) %>%
+  left_join(
+    ttwa2011_lsoa2011 %>%
+      group_by(TTWA11CD) %>%
+      summarise(TTWA11NM = first(TTWA11NM), .groups = 'drop'),
+    by = "TTWA11CD"
+  ) %>%
+  left_join(
+    TTWA_analysis_list %>%
+      left_join(ttwa_pop_agg %>% select(-ttwa_pop_2020_band), by = "TTWA11CD") %>%
+      mutate(ttwa_pop_2020_band = case_when(
+        ttwa_pop_2020 >= 650000 ~ "Large",
+        ttwa_pop_2020 < 650000 ~ "Small"
+      )) %>%
+      select(TTWA11CD, ttwa_pop_2020_band) %>%
+      rename(`Population Band` = ttwa_pop_2020_band),
+    by = "TTWA11CD"
+  )
+
+# Reorder columns
+summary_table_clean <- summary_table_clean %>%
+  select(TTWA11CD, TTWA11NM, `Model`, `Variable`,
+         `Population Band`, `Housing Affordability Band`,
+         `PC1 Estimate`, `PC1 Lower CI`, `PC1 Upper CI`, 
+         `Pandemic Interaction Estimate`, `Pandemic Interaction Lower CI`, `Pandemic Interaction Upper CI`,
+         everything())
+
+# Create separate tables for each variable (PC1_pandemic_hw_total, PC1_pandemic_pt_total, PC1_pandemic_hw_pt_total, PC1_HW_total, PC1_PT_total, PC1_HW_PT_total)
+summary_table_pandemic_hw_total <- summary_table_clean %>%
+  filter(Variable == "PC1_pandemic_hw_total")
+
+summary_table_pandemic_pt_total <- summary_table_clean %>%
+  filter(Variable == "PC1_pandemic_pt_total")
+
+summary_table_pandemic_hw_pt_total <- summary_table_clean %>%
+  filter(Variable == "PC1_pandemic_hw_pt_total")
+
+summary_table_hw_total <- summary_table_clean %>%
+  filter(Variable == "PC1_pandemic_hw_total")
+
+summary_table_pt_total <- summary_table_clean %>%
+  filter(Variable == "PC1_pandemic_pt_total")
+
+summary_table_hw_pt_total <- summary_table_clean %>%
+  filter(Variable == "PC1_pandemic_hw_pt_total")
+
+# Keep lines only for PC1 in original table and remove columns for triple interactions and "total" columns
+summary_table_clean <- summary_table_clean %>%
+  filter(Variable == "PC1") %>%
+  select(-"Pandemic and Homeworking Interaction Total Estimate", -"Pandemic and Homeworking Interaction Total Lower CI", -"Pandemic and Homeworking Interaction Total Upper CI", -"Pandemic and PT Interaction Total Estimate", -"Pandemic and PT Interaction Total Lower CI", -"Pandemic and PT Interaction Total Upper CI", -"Pandemic, PT and Homeworking Interaction Total Estimate", -"Pandemic, PT and Homeworking Interaction Total Lower CI", -"Pandemic, PT and Homeworking Interaction Total Upper CI", -"Homeworking Interaction Total Estimate", -"Homeworking Interaction Total Lower CI", -"Homeworking Interaction Total Upper CI", -"PT Interaction Total Estimate", -"PT Interaction Total Lower CI", -"PT Interaction Total Upper CI", -"Homeworking and PT Interaction Total Estimate", -"Homeworking and PT Interaction Total Lower CI", -"Homeworking and PT Interaction Total Upper CI")
+
+# Bring in results for each variable in the separate tables to the relevant column of the original table
+summary_table_clean <- summary_table_clean %>%
+  left_join(summary_table_pandemic_hw_total %>% select("TTWA11CD", "Model", "Pandemic and Homeworking Interaction Total Estimate", "Pandemic and Homeworking Interaction Total Lower CI", "Pandemic and Homeworking Interaction Total Upper CI"), by = c("TTWA11CD", "Model")) %>%
+  left_join(summary_table_pandemic_pt_total %>% select("TTWA11CD", "Model", "Pandemic and PT Interaction Total Estimate", "Pandemic and PT Interaction Total Lower CI", "Pandemic and PT Interaction Total Upper CI"), by = c("TTWA11CD", "Model")) %>%
+  left_join(summary_table_pandemic_hw_pt_total %>% select("TTWA11CD", "Model", "Pandemic, PT and Homeworking Interaction Total Estimate", "Pandemic, PT and Homeworking Interaction Total Lower CI", "Pandemic, PT and Homeworking Interaction Total Upper CI"), by = c("TTWA11CD", "Model")) %>%
+  left_join(summary_table_hw_total %>% select("TTWA11CD", "Model", "Homeworking Interaction Total Estimate", "Homeworking Interaction Total Lower CI", "Homeworking Interaction Total Upper CI"), by = c("TTWA11CD", "Model")) %>%
+  left_join(summary_table_pt_total %>% select("TTWA11CD", "Model", "PT Interaction Total Estimate", "PT Interaction Total Lower CI", "PT Interaction Total Upper CI"), by = c("TTWA11CD", "Model")) %>%
+  left_join(summary_table_hw_pt_total %>% select("TTWA11CD", "Model", "Homeworking and PT Interaction Total Estimate", "Homeworking and PT Interaction Total Lower CI", "Homeworking and PT Interaction Total Upper CI"), by = c("TTWA11CD", "Model"))
+
+# Arrange the table by Population Band, TTWA11CD and Model
+summary_table_clean <- summary_table_clean %>%
+  arrange(`Population Band`, TTWA11CD, Model)
+
+# Format estimate columns to include CIs and remove separate CI columns
+summary_table_clean <- summary_table_clean %>%
+  mutate(
+    `PC1 Estimate` = sprintf("%.4f", round(`PC1 Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `PC1 Estimate` = paste0(`PC1 Estimate`, " (", 
+                            sprintf("%.4f", round(`PC1 Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                            sprintf("%.4f", round(`PC1 Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    
+    `Pandemic Interaction Estimate` = sprintf("%.4f", round(`Pandemic Interaction Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `Pandemic Interaction Estimate` = paste0(`Pandemic Interaction Estimate`, " (", 
+                                             sprintf("%.4f", round(`Pandemic Interaction Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Pandemic Interaction Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    
+    `Homeworking Interaction Total Estimate` = sprintf("%.4f", round(`Homeworking Interaction Total Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `Homeworking Interaction Total Estimate` = paste0(`Homeworking Interaction Total Estimate`, " (", 
+                                             sprintf("%.4f", round(`Homeworking Interaction Total Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Homeworking Interaction Total Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    `PT Interaction Total Estimate` = sprintf("%.4f", round(`PT Interaction Total Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `PT Interaction Total Estimate` = paste0(`PT Interaction Total Estimate`, " (", 
+                                             sprintf("%.4f", round(`PT Interaction Total Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`PT Interaction Total Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    `Homeworking and PT Interaction Total Estimate` = sprintf("%.4f", round(`Homeworking and PT Interaction Total Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `Homeworking and PT Interaction Total Estimate` = paste0(`Homeworking and PT Interaction Total Estimate`, " (", 
+                                             sprintf("%.4f", round(`Homeworking and PT Interaction Total Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Homeworking and PT Interaction Total Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    `Pandemic and Homeworking Interaction Total Estimate` = sprintf("%.4f", round(`Pandemic and Homeworking Interaction Total Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+        `Pandemic and Homeworking Interaction Total Estimate` = paste0(`Pandemic and Homeworking Interaction Total Estimate`, " (", 
+                                             sprintf("%.4f", round(`Pandemic and Homeworking Interaction Total Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Pandemic and Homeworking Interaction Total Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+
+    `Pandemic and PT Interaction Total Estimate` = sprintf("%.4f", round(`Pandemic and PT Interaction Total Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `Pandemic and PT Interaction Total Estimate` = paste0(`Pandemic and PT Interaction Total Estimate`, " (", 
+                                             sprintf("%.4f", round(`Pandemic and PT Interaction Total Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Pandemic and PT Interaction Total Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")"),
+    `Pandemic, PT and Homeworking Interaction Total Estimate` = sprintf("%.4f", round(`Pandemic, PT and Homeworking Interaction Total Estimate`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .),
+    `Pandemic, PT and Homeworking Interaction Total Estimate` = paste0(`Pandemic, PT and Homeworking Interaction Total Estimate`, " (", 
+                                             sprintf("%.4f", round(`Pandemic, PT and Homeworking Interaction Total Lower CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ", ", 
+                                             sprintf("%.4f", round(`Pandemic, PT and Homeworking Interaction Total Upper CI`, 4)) %>% sub("^0+", "", .) %>% sub("^-0", "-", .), ")")
+  ) %>%
+  select(-`PC1 Lower CI`, -`PC1 Upper CI`, -`Pandemic Interaction Lower CI`, -`Pandemic Interaction Upper CI`, -`Homeworking Interaction Total Lower CI`, -`Homeworking Interaction Total Upper CI`, -`PT Interaction Total Lower CI`, -`PT Interaction Total Upper CI`, -`Homeworking and PT Interaction Total Lower CI`, -`Homeworking and PT Interaction Total Upper CI`, -`Pandemic and Homeworking Interaction Total Lower CI`, -`Pandemic and Homeworking Interaction Total Upper CI`, -`Pandemic and PT Interaction Total Lower CI`, -`Pandemic and PT Interaction Total Upper CI`, -`Pandemic, PT and Homeworking Interaction Total Lower CI`, -`Pandemic, PT and Homeworking Interaction Total Upper CI`)
+
+# Save table (S6)
+write_xlsx(summary_table_clean, path = here("Outputs", "TableS6_All_TTWAs_Results_Ext_Models.xlsx"))
+
+```
+
+## Figure A1: Plot the Many Models results (Multiple Model/LME4) (Large/Small TTWAs; Extension Models only) (OPTIONAL - Not in Paper)
+Here we plot all results for extension models only for 20 largest vs rest TTWAs.
+
+```{r manymodels plot large/small TTWAs extensions only}
+
+# Create a list of all the TTWAs where we run the analysis and fix column names
+TTWA_analysis_list <- as.data.frame(unique(combined_results$TTWA11CD)) %>%
+    rename("TTWA11CD" = "unique(combined_results$TTWA11CD)")
+
+# Bring in the mid-2020 population for each TTWA
+TTWA_analysis_list <- TTWA_analysis_list %>%
+    left_join(ttwa_pop_agg %>% select(-ttwa_pop_2020_band), by = "TTWA11CD")
+
+# Create a variable with Large/Small bands for TTWA population (above/below 650k population)
+TTWA_analysis_list <- TTWA_analysis_list %>%
+    mutate(ttwa_pop_2020_band = case_when(
+        ttwa_pop_2020 >= 650000 ~ "Large",
+        ttwa_pop_2020 < 650000 ~ "Small"
+    ))
+
+# Create separate dataframes for large and small TTWAs
+large_pop_TTWAs <- TTWA_analysis_list %>%
+    filter(ttwa_pop_2020_band == "Large") %>%
+    select(TTWA11CD)
+
+small_pop_TTWAs <- TTWA_analysis_list %>%
+    filter(ttwa_pop_2020_band == "Small") %>%
+    select(TTWA11CD)
+
+# Create a df with results for 20 largest TTWAs only
+large_pop_TTWAs_combined_results <- combined_results %>%
+    filter(TTWA11CD %in% large_pop_TTWAs$TTWA11CD)
+
+# Create a df with results for small TTWAs only
+small_pop_TTWAs_combined_results <- combined_results %>%
+    filter(TTWA11CD %in% small_pop_TTWAs$TTWA11CD)
+
+# Combine the datasets for 20 largest and Small TTWAs
+combined_results_large_small_pop <- bind_rows(
+  large_pop_TTWAs_combined_results %>% mutate(pop_band = "20 Largest TTWAs"),
+  small_pop_TTWAs_combined_results %>% mutate(pop_band = "Rest TTWAs")
+)
+
+# Set Plot titles for the subsets
+subset_labels <- c(
+  subset2 = "Model HW",
+  subset3 = "Model PT",
+  subset4 = "Model HW_PT"
+)
+
+# Separate datasets for plotting (Large & Small combined)
+PC1_terms <- combined_results_large_small_pop %>%
+  filter(term == "PC1") %>%
+  rename(PC1_estimate = estimate, PC1_lci = lci, PC1_uci = uci)
+
+interaction_PC1 <- combined_results_large_small_pop %>%
+  filter(term == "PC1:pandemic_period") %>%
+  rename(PC1_pandemic_estimate = estimate, PC1_pandemic_lci = lci, PC1_pandemic_uci = uci)
+
+interaction_PC1_hw_total <- combined_results_large_small_pop %>%
+  filter(term == "PC1_hw_effect1" & subset == "subset2") %>%
+  rename(PC1_HW_total_estimate = estimate, PC1_HW_total_lci = lci, PC1_HW_total_uci = uci)
+
+interaction_PC1_pt_total <- combined_results_large_small_pop %>%
+  filter(term == "PC1_pt_effect1" & subset == "subset3") %>%
+  rename(PC1_PT_total_estimate = estimate, PC1_PT_total_lci = lci, PC1_PT_total_uci = uci)
+
+interaction_PC1_hw_pt_total <- combined_results_large_small_pop %>%
+  filter(term == "PC1_hw_pt_effect1" & subset == "subset4") %>%
+  rename(PC1_HW_PT_total_estimate = estimate, PC1_HW_PT_total_lci = lci, PC1_HW_PT_total_uci = uci)
+
+interaction_PC1_pandemic_hw_total <- combined_results_large_small_pop %>%
+  filter(term == "PC1_hw_pandemic_effect1" & subset == "subset2") %>%
+  rename(PC1_pandemic_hw_total_estimate = estimate,
+         PC1_pandemic_hw_total_lci = lci,
+         PC1_pandemic_hw_total_uci = uci)
+
+interaction_PC1_pandemic_pt_total <- combined_results_large_small_pop %>%
+  filter(term == "PC1_pt_pandemic_effect1" & subset == "subset3") %>%
+  rename(PC1_pandemic_pt_total_estimate = estimate,
+         PC1_pandemic_pt_total_lci = lci,
+         PC1_pandemic_pt_total_uci = uci)
+
+interaction_PC1_pandemic_hw_pt_total <- combined_results_large_small_pop %>%
+  filter(term == "PC1_hw_pt_pandemic_effect1" & subset == "subset4") %>%
+  rename(PC1_pandemic_hw_pt_total_estimate = estimate,
+         PC1_pandemic_hw_pt_total_lci = lci,
+         PC1_pandemic_hw_pt_total_uci = uci)
+
+# Merge interaction terms with corresponding PC1 terms
+merged_PC1 <- left_join(interaction_PC1, PC1_terms, by = c("TTWA11CD", "subset", "pop_band"))
+merged_PC1_hw_total <- left_join(interaction_PC1_pandemic_hw_total, interaction_PC1_hw_total, by = c("TTWA11CD", "subset", "pop_band"))
+merged_PC1_pt_total <- left_join(interaction_PC1_pandemic_pt_total, interaction_PC1_pt_total, by = c("TTWA11CD", "subset", "pop_band"))
+merged_PC1_hw_pt_total <- left_join(interaction_PC1_pandemic_hw_pt_total, interaction_PC1_hw_pt_total, by = c("TTWA11CD", "subset", "pop_band"))
+
+# Combine all datasets for plotting
+interaction_combined <- bind_rows(
+  merged_PC1 %>% mutate(variable = "PC1"),
+  merged_PC1_hw_total %>% mutate(variable = "PC1_pandemic_hw_total"),
+  merged_PC1_pt_total %>% mutate(variable = "PC1_pandemic_pt_total"),
+  merged_PC1_hw_pt_total %>% mutate(variable = "PC1_pandemic_hw_pt_total")
+)
+
+# Remove data for subset1 (base model)
+interaction_combined <- interaction_combined %>%
+  filter(!subset == "subset1")
+
+# Plot theme
+custom_theme <- theme_classic(base_size = 75) +
+    theme(
+        axis.title.x = element_text(margin = margin(t = 20), size = 95),
+        axis.text.x = element_text(size = 75),
+        axis.title.y = element_text(margin = margin(r = 20), size = 95),
+        axis.text.y = element_text(size = 75),
+        legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 95),
+        legend.text = element_text(size = 95),
+        legend.margin = margin(t = -20),
+        legend.key.size = unit(1, "cm"),
+        strip.text = element_text(size = 85, hjust = 0.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 1.5)
+    )
+
+# Add a new column `level` to be used for colours in the plot 
+interaction_combined <- interaction_combined %>%
+  mutate(level = if_else(variable == "PC1", "Low", "High"))
+
+# Plot
+plot <- interaction_combined %>%
+  ggplot(aes(
+    x = if_else(variable == "PC1", PC1_estimate,
+                if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_estimate,
+                        if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_estimate,
+                                PC1_HW_PT_total_estimate))),
+    y = if_else(variable == "PC1", PC1_pandemic_estimate,
+                if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_estimate,
+                        if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_estimate,
+                                PC1_pandemic_hw_pt_total_estimate))),
+    color = level 
+  )) +
+  geom_hline(yintercept = 0, colour = "gray50", size = 1.5) +
+  geom_vline(xintercept = 0, colour = "gray50", size = 1.5) +
+  geom_errorbar(aes(
+    ymin = if_else(variable == "PC1", PC1_pandemic_lci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_lci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_lci,
+                                   PC1_pandemic_hw_pt_total_lci))),
+    ymax = if_else(variable == "PC1", PC1_pandemic_uci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_uci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_uci,
+                                   PC1_pandemic_hw_pt_total_uci)))
+  ), colour = "gray80", width = 0.02, alpha = 0.35) +
+  geom_errorbarh(aes(
+    xmin = if_else(variable == "PC1", PC1_lci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_lci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_lci,
+                                   PC1_HW_PT_total_lci))),
+    xmax = if_else(variable == "PC1", PC1_uci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_uci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_uci,
+                                   PC1_HW_PT_total_uci)))
+  ), colour = "gray80", height = 0.02, alpha = 0.35) +
+  geom_point(size = 13, alpha = 0.35) +
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed", size = 5.0, span = 0.92) +
+  labs(
+    x = "Main Effect Coefficient",
+    y = "Interaction Term Coefficient",
+    color = "HW/PT/HW_PT Level"
+  ) +
+  scale_color_manual(values = c(
+    "Low" = "#1f77b4",  
+    "High" = "#ff7f0e"
+  )) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  custom_theme +
+  facet_wrap(~ subset + pop_band, labeller = labeller(subset = subset_labels), ncol = 2) +
+  scale_y_continuous(breaks = seq(-0.5, 0.2, by = 0.05), labels = scales::label_number(accuracy = 0.05)) +
+  scale_x_continuous(breaks = seq(-2, 2, by = 0.5)) +
+  coord_cartesian(xlim = c(-2, 2), ylim = c(-0.15, 0.1)) +
+  geom_hline(yintercept = seq(-0.5, 0.2, by = 0.05), color = "grey90", size = 2.5, linetype = "dashed")
+
+# Save plot
+ggsave(filename = here("Outputs", "FigA1_England_ManyModels_PCvsPandemicInt_Sales_LargeSmall_TTWAs_Panel_650k_v2.png"), plot, width = 70, height = 50, limitsize = FALSE)
+
+```
+
+## Figure A2: Plot the Many Models results (Multiple Model/LME4) (High/Low Housing Affordability TTWAs; Extension Models only) (OPTIONAL - Not in Paper)
+Here we plot all results for extension models only for high vs low housing affordability TTWAs.
+
+```{r manymodels plot high/low HA TTWAs extensions only}
+
+# Create a list of the High Housing Affordability TTWAs (above median housing affordability ratio for TTWAs in analysis)
+high_ha_TTWAs <- ttwa_affordability_analysis_only %>%
+  filter(ttwa_ha_2023_ratio_band_analysis_only == "High Housing Affordability") %>%
+  select(TTWA11CD)
+
+# Create a list of the Low Housing Affordability TTWAs (below median housing affordability ratio for TTWAs in analysis)
+low_ha_TTWAs <- ttwa_affordability_analysis_only %>%
+  filter(ttwa_ha_2023_ratio_band_analysis_only == "Low Housing Affordability") %>%
+  select(TTWA11CD)
+
+# Create a df with results for high housing affordability TTWAs only
+high_ha_TTWAs_combined_results <- combined_results %>%
+  filter(TTWA11CD %in% high_ha_TTWAs$TTWA11CD)
+
+# Create a df with results for low housing affordability TTWAs only
+low_ha_TTWAs_combined_results <- combined_results %>%
+  filter(TTWA11CD %in% low_ha_TTWAs$TTWA11CD)
+
+# Combine the datasets for High and Low Housing Affordability TTWAs
+combined_results_high_low_ha <- bind_rows(
+  high_ha_TTWAs_combined_results %>% mutate(ha_afford_band = "High Housing Affordability"),
+  low_ha_TTWAs_combined_results %>% mutate(ha_afford_band = "Low Housing Affordability")
+)
+
+# Set Plot titles for the subsets
+subset_labels <- c(
+  subset2 = "Model HW",
+  subset3 = "Model PT",
+  subset4 = "Model HW_PT"
+)
+
+# Separate datasets for plotting (High and Low combined)
+PC1_terms <- combined_results_high_low_ha %>%
+  filter(term == "PC1") %>%
+  rename(PC1_estimate = estimate, PC1_lci = lci, PC1_uci = uci)
+
+interaction_PC1 <- combined_results_high_low_ha %>%
+  filter(term == "PC1:pandemic_period") %>%
+  rename(PC1_pandemic_estimate = estimate, PC1_pandemic_lci = lci, PC1_pandemic_uci = uci)
+
+interaction_PC1_hw_total <- combined_results_high_low_ha %>%
+  filter(term == "PC1_hw_effect1" & subset == "subset2") %>%
+  rename(PC1_HW_total_estimate = estimate, PC1_HW_total_lci = lci, PC1_HW_total_uci = uci)
+
+interaction_PC1_pt_total <- combined_results_high_low_ha %>%
+  filter(term == "PC1_pt_effect1" & subset == "subset3") %>%
+  rename(PC1_PT_total_estimate = estimate, PC1_PT_total_lci = lci, PC1_PT_total_uci = uci)
+
+interaction_PC1_hw_pt_total <- combined_results_high_low_ha %>%
+  filter(term == "PC1_hw_pt_effect1" & subset == "subset4") %>%
+  rename(PC1_HW_PT_total_estimate = estimate, PC1_HW_PT_total_lci = lci, PC1_HW_PT_total_uci = uci)
+
+interaction_PC1_pandemic_hw_total <- combined_results_high_low_ha %>%
+  filter(term == "PC1_hw_pandemic_effect1" & subset == "subset2") %>%
+  rename(PC1_pandemic_hw_total_estimate = estimate,
+         PC1_pandemic_hw_total_lci = lci,
+         PC1_pandemic_hw_total_uci = uci)
+
+interaction_PC1_pandemic_pt_total <- combined_results_high_low_ha %>%
+  filter(term == "PC1_pt_pandemic_effect1" & subset == "subset3") %>%
+  rename(PC1_pandemic_pt_total_estimate = estimate,
+         PC1_pandemic_pt_total_lci = lci,
+         PC1_pandemic_pt_total_uci = uci)
+
+interaction_PC1_pandemic_hw_pt_total <- combined_results_high_low_ha %>%
+  filter(term == "PC1_hw_pt_pandemic_effect1" & subset == "subset4") %>%
+  rename(PC1_pandemic_hw_pt_total_estimate = estimate,
+         PC1_pandemic_hw_pt_total_lci = lci,
+         PC1_pandemic_hw_pt_total_uci = uci)
+
+# Merge interaction terms with corresponding PC1 terms
+merged_PC1 <- left_join(interaction_PC1, PC1_terms, by = c("TTWA11CD", "subset", "ha_afford_band"))
+merged_PC1_hw_total <- left_join(interaction_PC1_pandemic_hw_total, interaction_PC1_hw_total, by = c("TTWA11CD", "subset", "ha_afford_band"))
+merged_PC1_pt_total <- left_join(interaction_PC1_pandemic_pt_total, interaction_PC1_pt_total, by = c("TTWA11CD", "subset", "ha_afford_band"))
+merged_PC1_hw_pt_total <- left_join(interaction_PC1_pandemic_hw_pt_total, interaction_PC1_hw_pt_total, by = c("TTWA11CD", "subset", "ha_afford_band"))
+
+# Combine all datasets for plotting
+interaction_combined <- bind_rows(
+  merged_PC1 %>% mutate(variable = "PC1"),
+  merged_PC1_hw_total %>% mutate(variable = "PC1_pandemic_hw_total"),
+  merged_PC1_pt_total %>% mutate(variable = "PC1_pandemic_pt_total"),
+  merged_PC1_hw_pt_total %>% mutate(variable = "PC1_pandemic_hw_pt_total")
+)
+
+# Remove data for subset1 (base model)
+interaction_combined <- interaction_combined %>%
+  filter(!subset == "subset1")
+
+# Plot theme
+custom_theme <- theme_classic(base_size = 75) +
+    theme(
+        axis.title.x = element_text(margin = margin(t = 20), size = 95),
+        axis.text.x = element_text(size = 75),
+        axis.title.y = element_text(margin = margin(r = 20), size = 95),
+        axis.text.y = element_text(size = 75),
+        legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 95),
+        legend.text = element_text(size = 95),
+        legend.margin = margin(t = -20),
+        legend.key.size = unit(1, "cm"),
+        strip.text = element_text(size = 85, hjust = 0.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 1.5)
+    )
+
+# Add a new column `level` to be used for colours in the plot 
+interaction_combined <- interaction_combined %>%
+  mutate(level = if_else(variable == "PC1", "Low", "High"))
+
+# Plot
+plot <- interaction_combined %>%
+  ggplot(aes(
+    x = if_else(variable == "PC1", PC1_estimate,
+                if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_estimate,
+                        if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_estimate,
+                                PC1_HW_PT_total_estimate))),
+    y = if_else(variable == "PC1", PC1_pandemic_estimate,
+                if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_estimate,
+                        if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_estimate,
+                                PC1_pandemic_hw_pt_total_estimate))),
+    color = level
+  )) +
+  geom_hline(yintercept = 0, colour = "gray50", size = 1.5) +
+  geom_vline(xintercept = 0, colour = "gray50", size = 1.5) +
+  geom_errorbar(aes(
+    ymin = if_else(variable == "PC1", PC1_pandemic_lci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_lci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_lci,
+                                   PC1_pandemic_hw_pt_total_lci))),
+    ymax = if_else(variable == "PC1", PC1_pandemic_uci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_pandemic_hw_total_uci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_pandemic_pt_total_uci,
+                                   PC1_pandemic_hw_pt_total_uci)))
+  ), colour = "gray80", width = 0.02, alpha = 0.35) +
+  geom_errorbarh(aes(
+    xmin = if_else(variable == "PC1", PC1_lci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_lci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_lci,
+                                   PC1_HW_PT_total_lci))),
+    xmax = if_else(variable == "PC1", PC1_uci,
+                   if_else(variable == "PC1_pandemic_hw_total", PC1_HW_total_uci,
+                           if_else(variable == "PC1_pandemic_pt_total", PC1_PT_total_uci,
+                                   PC1_HW_PT_total_uci)))
+  ), colour = "gray80", height = 0.02, alpha = 0.35) +
+  geom_point(size = 13, alpha = 0.35) +
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed", size = 5.0, span = 0.92) +
+  labs(
+    x = "Main Effect Coefficient",
+    y = "Interaction Term Coefficient",
+    color = "HW/PT/HW_PT Level"
+  ) +
+  scale_color_manual(values = c(
+    "Low" = "#1f77b4",  
+    "High" = "#ff7f0e"
+  )) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  custom_theme +
+  facet_wrap(~ subset + ha_afford_band, labeller = labeller(subset = subset_labels), ncol = 2) +
+  scale_y_continuous(breaks = seq(-0.5, 0.2, by = 0.05), labels = scales::label_number(accuracy = 0.05)) +
+  scale_x_continuous(breaks = seq(-2, 2, by = 0.5)) +
+  coord_cartesian(xlim = c(-2, 2), ylim = c(-0.15, 0.1)) +
+  geom_hline(yintercept = seq(-0.5, 0.2, by = 0.05), color = "grey90", size = 2.5, linetype = "dashed")
+
+# Save plot
+ggsave(filename = here("Outputs", "FigA2_England_ManyModels_PCvsPandemicInt_Sales_HighLow_Hous_Afford_TTWAs_Panel_v2.png"), plot, width = 70, height = 50, limitsize = FALSE)
+
+```
+
+
+
+
+
